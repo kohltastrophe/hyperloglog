@@ -6,6 +6,15 @@
 		"ReplicatedStorage": {
 			"HyperLogLog": {
 				"$path": "../src"
+			},
+			"sert": {
+				"$path": "../.sert/sert/src"
+			},
+			"HyperLogLog.Tests": {
+				"$path": "runner/Config.luau"
+			},
+			"unit": {
+				"$path": "unit"
 			}
 		}
 	}

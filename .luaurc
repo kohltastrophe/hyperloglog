@@ -1,0 +1,6 @@
+{
+	"aliases": {
+		"sert": "./.sert/sert/src",
+		"stage": "./.sert/stage"
+	}
+}
