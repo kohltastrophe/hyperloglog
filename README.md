@@ -1,151 +1,104 @@
-## 💡 What is HyperLogLog?
+# HyperLogLog
 
-HyperLogLog (HLL) is a probabilistic algorithm that allows you to estimate the number of unique items in a set (its "cardinality") using a very small, fixed amount of memory.
+[![CI](https://img.shields.io/github/actions/workflow/status/kohltastrophe/hyperloglog/ci.yml?style=for-the-badge)](https://github.com/kohltastrophe/hyperloglog/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kohltastrophe/hyperloglog/badges/coverage.json&style=for-the-badge)](https://github.com/kohltastrophe/hyperloglog/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/kohltastrophe/hyperloglog?style=for-the-badge)](LICENSE.md)
 
-For example, you can use it to answer questions like:
+A HyperLogLog++ cardinality estimator for Luau. It counts distinct numbers, strings, and buffers using at most 16 KB of memory at the default precision (`p = 14`, ~0.81% standard error).
 
-- "How many **unique players** joined my game today?"
-- "How many **unique votes** were cast in this poll?"
-- "How many **unique items** were favorited this week?"
+- **Low memory:** Starts in a compact sparse list for small counts and promotes to a fixed `1 + 2^p` byte `buffer` once more than $m / 4$ registers are set.
+- **Accurate across all sizes:** Uses LinearCounting for small sets and HyperLogLog++ bias correction below $5m$ across all precisions ($p \in [4, 18]$).
+- **Built-in serialization:** [`serialize`](#hyperloglogserialize) and [`deserialize`](#hyperloglogdeserializedata) pack and validate estimators into a standalone `buffer` for `DataStore` or `MessagingService`.
+- **Cross-server merging:** [`merge`](#hyperloglogmergeother) combines estimators of matching precision in place.
 
-...all while using just a few kilobytes of memory, even if the number of items is in the millions or billions.
-
-## 🤔 Why use HyperLogLog?
-
-Counting unique items seems simple, but it can be very difficult at scale.
-
-Imagine you want to count the unique players who join your game in a day. The "simple" way is to store every unique `UserId` in a table and check `#table` at the end. If you have 10,000 unique players, your table is small. If you have **10 million** unique players, that table becomes enormous, consuming vast amounts of memory.
-
-> This is commonly known as the [count-distinct problem](https://en.wikipedia.org/wiki/Count-distinct_problem) in computer science.
-
-HyperLogLog solves this problem by trading perfect accuracy for massive efficiency.
-
-- **🚀 Extremely Fast:** Adding an item is just a quick hashing operation and a memory check. It's a constant-time operation $O(1)$ that doesn't slow down as the count grows.
-- **💾 Incredibly Memory-Efficient:** This is the key benefit. A HyperLogLog counter uses a **small, fixed amount of memory** (just a few kilobytes) whether you add 1,000 items or 1,000,000,000 items.
-- **🤝 Mergeable:** You can take two separate HLL counters (e.g., from different game servers) and merge them together. The resulting counter will give you the estimated unique count _across both sets_. This is extremely powerful for distributed data.
-- **📈 Tunable Accuracy:** It's an estimate, but it's a very good one. You can control the accuracy vs. memory trade-off using the `precision` parameter. A higher precision gives you a more accurate estimate at the cost of more memory.
-
-It's the perfect tool for when you need a "good enough" count of unique items at a massive scale, without sacrificing performance or memory.
-
-## 🛠️ Installation
-
-1.  Download [`init.luau`](src/init.luau) from the `src/` directory.
-2.  Place the file into your project (e.g., `ServerStorage/Modules/HyperLogLog`).
-3.  Require the module in your script:
+## Quick Start
 
 ```luau
-local HyperLogLog = require(game.ServerStorage.Modules.HyperLogLog)
-```
+local HyperLogLog = require(path.to.HyperLogLog)
 
-## 🚀 Quick Start
+local serverA = HyperLogLog.new(14)
+for userId = 1, 10_000 do
+	serverA:add(userId)
+end
+serverA:add("guest:session-42")
 
-Here's a simple example of counting 1,000 unique items.
+print(serverA:estimate()) --> ~10001
 
-```luau
-local HyperLogLog = require(game.ServerStorage.Modules.HyperLogLog)
+-- Save to a buffer for DataStore or MessagingService
+local payload = serverA:serialize()
+local restored = HyperLogLog.deserialize(payload)
 
--- Create a new HLL counter with precision 14 (default)
--- Higher precision = more accuracy, but more memory.
-local counter = HyperLogLog.new(14)
-
--- Add 1,000 unique items to the counter
-for i = 1, 1000 do
-	counter:add(i)
+-- Merge counts from another server
+local serverB = HyperLogLog.new(14)
+for userId = 5_001, 15_000 do
+	serverB:add(userId)
 end
 
--- Estimate the cardinality
-local uniqueCount = counter:estimate()
-
--- The estimate will be very close to 1000
-print("Estimated unique items: " .. uniqueCount)
+if restored then
+	restored:merge(serverB)
+	print(restored:estimate()) --> ~15001
+end
 ```
 
-## 📚 API Reference
+## Precision, Memory & Standard Error
 
-### `HyperLogLog.new(precision)`
+Pass a precision `p` from `4` to `18` to choose your memory and accuracy trade-off ($m = 2^p$ registers). Estimators start in a compact sparse list and switch to a fixed `1 + m` byte `buffer` once more than $m / 4$ registers are set.
 
-Creates a new, empty HyperLogLog counter.
+| Precision (`p`) | Registers (`m = 2^p`) | Dense Memory (`1 + m`) | Standard Error (`1.04 / sqrt(m)`) |
+| :--- | :--- | :--- | :--- |
+| `10` | `1,024` | `1 KB` (`1,025 B`) | `3.25%` |
+| `12` | `4,096` | `4 KB` (`4,097 B`) | `1.63%` |
+| `14` *(default)* | `16,384` | `16 KB` (`16,385 B`) | `0.81%` |
+| `16` | `65,536` | `64 KB` (`65,537 B`) | `0.41%` |
+| `18` | `262,144` | `256 KB` (`262,145 B`) | `0.20%` |
 
-- **`precision`** (number?): An integer between 4 and 18. This defines the accuracy and memory usage. It defaults to `14`.
-  - Memory usage is $2^p$ (e.g., `p=14` uses $2^{14} = 16384$ 1 byte registers).
-  - Standard error is $\approx 1.04 / \sqrt{2^p}$.
-- **Returns**: (HyperLogLog): A new counter object.
+## API Reference
 
----
-
-### `HLL:add(item)`
-
-Adds an item to the counter.
-
-- **`item`** (buffer | number): The unique item identifier to add.
-
----
-
-### `HLL:estimate()`
-
-Calculates and returns the current estimated cardinality.
-
-- **Returns**: (number): The estimated number of unique items added so far, rounded to the nearest integer.
-
----
-
-### `HLL:merge(other)`
-
-Merges another HLL counter into this one. This is useful for combining distributed or parallel counts.
-
-> [!WARNING]
-> Both counters **must** have been created with the same precision (`p`).
-
-- **`other`** (HyperLogLog): The other counter to merge into this one. This operation modifies the current counter.
+### `HyperLogLog.new(precision?)`
 
 ```luau
--- Count unique players on Server 1
-local server1_uniques = HyperLogLog.new(14)
-server1_uniques:add(1)
-server1_uniques:add(2)
-
--- Count unique players on Server 2
-local server2_uniques = HyperLogLog.new(14)
-server2_uniques:add(2)
-server2_uniques:add(3)
-
--- Merge Server 2's count into Server 1's
-server1_uniques:merge(server2_uniques)
-
--- The estimate will now be ~3 (1, 2, 3)
-print(server1_uniques:estimate())
+function HyperLogLog.new(precision: number?): HyperLogLog
 ```
 
----
+Creates an empty `HyperLogLog` estimator. `precision` is floored and clamped to `[4, 18]` and defaults to `14`.
 
-### `HLL:serialize()`
-
-Returns a serialized buffer containing the counter's state. This is useful for saving the counter in a `DataStore`.
-
-- **Returns**: (buffer): A buffer with the `p` (precision) and `registers` (internal state).
+### `HyperLogLog:add(item)`
 
 ```luau
-local state = counter:serialize()
--- Now you can save 'state' to a DataStore
+function HyperLogLog:add(item: buffer | number | string): ()
 ```
 
----
+Adds a number, string, or buffer to the estimator. Numbers are hashed as 64-bit floats, so `1` and `1.0` count as the same item. Strings and buffers are hashed by their raw bytes, so `"abc"` and `buffer.fromstring("abc")` also match.
+
+### `HyperLogLog:estimate()`
+
+```luau
+function HyperLogLog:estimate(): number
+```
+
+Returns the estimated number of distinct items added so far, rounded to the nearest integer.
+
+### `HyperLogLog:merge(other)`
+
+```luau
+function HyperLogLog:merge(other: HyperLogLog): ()
+```
+
+Merges `other` into `self` in place so `self:estimate()` reflects the union of both estimators. Throws an error if `self` and `other` have different precisions.
+
+### `HyperLogLog:serialize()`
+
+```luau
+function HyperLogLog:serialize(): buffer
+```
+
+Packs the estimator into a standalone `buffer` for storage or network transport. Dense estimators take `1 + 2^p` bytes, and sparse estimators varint-compress their active registers.
 
 ### `HyperLogLog.deserialize(data)`
 
-Reloads a counter from a serialized buffer.
-
-- **`data`** (buffer): A state buffer previously generated by `HLL:serialize()`.
-- **Returns**: (HyperLogLog): A new counter object with the restored state.
-
 ```luau
--- 'savedState' is loaded from a DataStore
-local counter = HyperLogLog.deserialize(savedState)
-
--- You can now continue adding items or estimating
-counter:add(newUserId)
-print(counter:estimate())
+function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 ```
+
+Restores a `HyperLogLog` estimator from a buffer created by `HyperLogLog:serialize()`. Dense buffers are copied so the returned estimator never shares memory with `data`. If the buffer is invalid or corrupted, `deserialize` warns and returns `nil`.
 
 ## Credits
 
@@ -153,5 +106,5 @@ Thanks to [@XoifailTheGod](https://www.roblox.com/users/558808710) for helping o
 
 ## References
 
-- https://research.google.com/pubs/archive/40671.pdf
-- https://docs.google.com/document/d/1gyjfMHy43U9OWBXxfaeG-3MjGzejW1dlpyMwEYAAWEI/mobilebasic
+- Heule, Nunkesser, Hall — [*HyperLogLog in Practice: Algorithmic Engineering of a State of The Art Cardinality Estimation Algorithm*](https://research.google.com/pubs/archive/40671.pdf)
+- [*HyperLogLog++ Bias Correction Empirical Data*](https://docs.google.com/document/d/1gyjfMHy43U9OWBXxfaeG-3MjGzejW1dlpyMwEYAAWEI/mobilebasic)
