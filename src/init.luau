@@ -22,8 +22,7 @@ for v1 = 0, 63 do
 end
 
 --stylua: ignore
--- Means of the empirically determined bias corrections. These values have been determined in a
--- simulation of HLL++ on random input data and are used to correct the bias of the raw estimate.
+-- Empirical raw estimate means from the HLL++ paper (precisions 4..18)
 local MEAN_DATA = table.freeze({
 	-- precision 4
 	{
@@ -429,8 +428,7 @@ local MEAN_DATA = table.freeze({
 })
 
 --stylua: ignore
--- Empirically determined biases. These values have been determined in a simulation of HLL++ on
--- random input data and are used to correct the bias of the raw estimate.
+-- Empirical bias values corresponding to MEAN_DATA (precisions 4..18)
 local BIAS_DATA = table.freeze({
 	-- precision 4
 	{
@@ -955,12 +953,10 @@ for idx = 1, MAXIMUM_PRECISION - MINIMUM_PRECISION + 1 do
 	SLOPE_DATA[idx] = slopes
 end
 
--- Sparse registers use a higher precision p' for better accuracy at low cardinalities. Their ranks fit in 6 bits,
--- which the sparse serialization format relies on.
+-- Sparse mode uses precision p' = 25 so ranks fit in 6 bits (1..40) for varint packing
 local SPARSE_PRECISION = 25
 local SPARSE_REGISTERS = 2 ^ SPARSE_PRECISION
 local SPARSE_MAX_RHO = 64 - SPARSE_PRECISION + 1
--- A counter switches to dense registers once more than m * DENSE_THRESHOLD_RATIO sparse registers are set
 local DENSE_THRESHOLD_RATIO = 0.25
 
 -- Linear counting is used below these empirically determined cardinalities
@@ -1030,8 +1026,7 @@ local function estimateBias(estimate: number, p: number): number
 end
 
 --[[
-HyperLogLog++ cardinality estimator for counting distinct numbers, strings, and buffers in bounded memory.
-Starts in a high-precision sparse representation (`p' = 25`) and promotes to `m = 2^p` dense 1-byte registers once more than `m / 4` sparse registers are populated.
+HyperLogLog++ cardinality estimator for counting distinct numbers, strings, and buffers.
 ]]
 local HyperLogLog = {}
 HyperLogLog.__index = HyperLogLog
@@ -1088,8 +1083,8 @@ local function flushSparse(hll: HyperLogLog): number
 	return out
 end
 
--- Raises the dense registers in `dst` to account for `src`'s sparse registers. The dense index is the top p bits of
--- the sparse index, and when the remaining sparse index bits are all zero the run of zeros continues into the sparse rho.
+-- Folds sparse p' = 25 registers into dense precision p registers. When the middle (25 - p)
+-- index bits are all zero, the leading-zero run continues into the sparse rho.
 local function foldSparseHLL(dst: HyperLogLog, src: HyperLogLog)
 	local b = dst.buffer :: buffer
 	local p = dst.p
@@ -1164,7 +1159,7 @@ local function toDense(hll: HyperLogLog)
 end
 
 --[[
-Creates a new [HyperLogLog] estimator with `precision` floored and clamped to `[4, 18]` (defaults to `14`, or `m = 16,384` registers).
+Creates a new [HyperLogLog] estimator. `precision` is clamped to `[4, 18]` and defaults to `14` (`16,384` registers).
 ]]
 function HyperLogLog.new(precision: number?): HyperLogLog
 	local p = math.clamp(math.floor(precision or DEFAULT_PRECISION), MINIMUM_PRECISION, MAXIMUM_PRECISION)
@@ -1229,8 +1224,7 @@ local function mixStringLookup3(item: string, len: number, a: number, b: number,
 end
 
 --[[
-Hashes `item` and updates the target register's leading-zero rank.
-Numbers are hashed as 8-byte IEEE 754 floats, and strings and buffers by their raw bytes.
+Adds a number, string, or buffer to the estimator.
 ]]
 function HyperLogLog.add(self: HyperLogLog, item: buffer | number | string)
 	local bxor = bit32.bxor
@@ -1332,7 +1326,6 @@ end
 
 --[[
 Returns the estimated number of distinct items added so far, rounded to the nearest integer.
-Uses LinearCounting over the sparse registers or at low dense cardinalities, and empirical bias correction below `5 * m`.
 ]]
 function HyperLogLog.estimate(self: HyperLogLog): number
 	if self.sparse_registers then
@@ -1391,8 +1384,7 @@ function HyperLogLog.estimate(self: HyperLogLog): number
 end
 
 --[[
-Folds `other`'s registers into `self` in place by taking the maximum rank per register.
-Throws an error if `self` and `other` were created with different precisions.
+Merges `other` into `self` in place. Throws if `self` and `other` have different precisions.
 ]]
 function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 	if self.p ~= other.p then
@@ -1454,8 +1446,7 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 end
 
 --[[
-Serializes the estimator's registers into a standalone `buffer` suitable for DataStore persistence or network transport.
-Dense estimators serialize to `1 + 2^p` bytes (precision byte followed by one byte per register); sparse estimators write `p + 128`, a `u32` register count, and varint-encoded deltas of sorted `index * 64 + rho` entries.
+Serializes the estimator into a standalone `buffer`.
 ]]
 function HyperLogLog.serialize(self: HyperLogLog): buffer
 	local values = self.sparse_registers
@@ -1556,7 +1547,7 @@ end
 
 --[[
 Restores a [HyperLogLog] estimator from a buffer produced by [HyperLogLog.serialize].
-Copies dense register data so the estimator never aliases `data`, and returns `nil` with a warning if the header, length, or register ranks are invalid.
+Returns `nil` and warns if the buffer is malformed.
 ]]
 function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 	if type(data) ~= "buffer" then
