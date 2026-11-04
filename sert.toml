@@ -3,8 +3,9 @@
 #   fetch                 the pinned sert package and luau into .sert/ (gitignored)
 #   run [-a ARGS]         the headless suite ([test].entries; ARGS go to test/spec.client.luau)
 #   studio                the suite in a fresh, unattended Studio (edit mode)
-#   lint / types / mutate static checks, compile-time type tests, and mutation testing
+#   lint / coverage / mutate static checks, compile-time type tests, and mutation testing
 #   coverage --min 95     line coverage after `run --coverage`
+#   dist --from REV       the released tree onto the dist branch
 #
 # Work against a sert checkout: put `[override] sert = "../sert"` in sert.local.toml (gitignored).
 
@@ -17,6 +18,8 @@ luau = "0.724"
 [test]
 entries = ["test/spec.client.luau"]
 stage = "default.project.json"
+codegen = false
+jobs = 1
 
 [coverage]
 min = 95
@@ -37,6 +40,17 @@ registration = { aggregator = "test/unit/init.luau", specs = "test/unit/*.spec.l
 pass = ["test/types"]
 fail = ["test/types/fail"]
 solvers = ["new", "old"]
+
+[release]
+prefix = "v"
+versions = [
+	{ file = "wally.toml", key = "package.version" },
+]
+
+[dist]
+paths = ["LICENSE.md", "default.project.json", "src"]
+branch = "dist"
+name = "HyperLogLog"
 
 [cloud]
 project = "test/default.project.json"

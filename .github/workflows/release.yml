@@ -1,0 +1,134 @@
+# Release HyperLogLog. kohltastrophe/release keeps a release PR open on main that bumps wally.toml and CHANGELOG.md;
+# merging it tags v<version>, builds the .rbxm and Wally package, creates the GitHub release, updates the `dist`
+# branch, and publishes to Wally.
+name: Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Build and package only; no GitHub release, no Wally publish
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.MY_RELEASE_PLEASE_TOKEN || github.token }}
+
+      - name: Release PR or Release
+        id: release
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          token: ${{ secrets.MY_RELEASE_PLEASE_TOKEN || github.token }}
+          dry-run: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+          wait-for-ci: ci.yml
+
+      - uses: CompeyDev/setup-rokit@1d9390883f7ebce19d48f5b8d006e11d387c92ab # v0.2.1
+        if: steps.release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          version: v1.2.0
+
+      - name: Build the release assets
+        if: steps.release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          mkdir -p dist
+          rojo build default.project.json --output dist/HyperLogLog.rbxm
+          wally package --list
+          wally package --output "$RUNNER_TEMP/wally.zip"
+          size=$(stat -c %s "$RUNNER_TEMP/wally.zip")
+          echo "Wally package: $size bytes (the registry refuses more than 2 MiB)"
+          [ "$size" -le 2097152 ]
+          cp "$RUNNER_TEMP/wally.zip" "dist/HyperLogLog-$VERSION-package.zip"
+          (cd dist && sha256sum HyperLogLog.rbxm "HyperLogLog-$VERSION-package.zip" > SHA256SUMS)
+          { echo '```'; cat dist/SHA256SUMS; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.release.outputs.should_release == 'true' || github.event_name == 'workflow_dispatch'
+        with:
+          name: release
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+
+      - name: Create GitHub release
+        if: steps.release.outputs.should_release == 'true'
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.release.outputs.tag }}
+          VERSION: ${{ steps.release.outputs.version }}
+          PRERELEASE: ${{ steps.release.outputs.prerelease }}
+          NOTES_FILE: ${{ steps.release.outputs.notes_file }}
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          assets=(HyperLogLog.rbxm "HyperLogLog-$VERSION-package.zip" SHA256SUMS)
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "${assets[@]}" --clobber
+            gh release edit "$TAG" --title "HyperLogLog $VERSION" --notes-file "$NOTES_FILE"
+          elif git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
+            if [ "$PRERELEASE" = true ]; then
+              gh release create "$TAG" "${assets[@]}" --title "HyperLogLog $VERSION" --notes-file "$NOTES_FILE" --prerelease
+            else
+              gh release create "$TAG" "${assets[@]}" --title "HyperLogLog $VERSION" --notes-file "$NOTES_FILE"
+            fi
+          elif [ "$PRERELEASE" = true ]; then
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" --title "HyperLogLog $VERSION" --notes-file "$NOTES_FILE" --prerelease
+          else
+            gh release create "$TAG" "${assets[@]}" --target "$GITHUB_SHA" --title "HyperLogLog $VERSION" --notes-file "$NOTES_FILE"
+          fi
+
+      - name: Update dist branch
+        if: steps.release.outputs.should_release == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin dist > /dev/null; then
+            git fetch --no-tags origin dist:dist
+          fi
+          python3 tools/sert.py dist --from "$GITHUB_SHA"
+          git log -1 --format='%H %s' dist
+          git push origin dist
+
+      - name: Publish kohltastrophe/hyperloglog to Wally
+        if: steps.release.outputs.should_release == 'true'
+        env:
+          WALLY_AUTH_TOKEN: ${{ secrets.WALLY_AUTH_TOKEN }}
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          if [ -z "$WALLY_AUTH_TOKEN" ]; then echo "::notice::No WALLY_AUTH_TOKEN secret: Wally publish skipped"; exit 0; fi
+          wally login --token "$WALLY_AUTH_TOKEN"
+          # `wally publish` exits 0 even when the registry refuses the package, so read what it printed.
+          output=$(wally publish 2>&1) || { echo "$output"; exit 1; }
+          echo "$output"
+          case "$output" in
+            *"published successfully"*) ;;
+            *"already exists"*) echo "::notice::kohltastrophe/hyperloglog@$VERSION was already on Wally" ;;
+            *) echo "::error::Wally did not accept kohltastrophe/hyperloglog@$VERSION"; exit 1 ;;
+          esac
