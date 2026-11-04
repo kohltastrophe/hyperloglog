@@ -12,11 +12,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: "ci-${{ github.ref }}-${{ startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release') && github.sha || '' }}"
+  cancel-in-progress: "${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release') }}"
 
 defaults:
   run:
@@ -28,14 +28,21 @@ jobs:
     name: Lint, Coverage & Mutation
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-          submodules: recursive
           persist-credentials: false
 
       - uses: kohltastrophe/sert/actions/setup@v0.1.0
+
+      - name: Conventional Commits and version check
+        uses: kohltastrophe/release@v1.0.0
+        with:
+          mode: check
+          pr-title: ${{ github.event.pull_request.title }}
 
       - name: sert lint
         run: python3 tools/sert.py lint
@@ -47,6 +54,7 @@ jobs:
         run: python3 tools/sert.py coverage --min 95 --badge
 
       - name: sert mutate
+        if: "!startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release')"
         run: python3 tools/sert.py mutate --no-coverage-run --min 85
 
       - name: Update coverage badge
@@ -56,7 +64,7 @@ jobs:
         run: python3 tools/sert.py coverage --badge-branch --badge-push
 
   roblox:
-    if: github.event_name != 'schedule'
+    if: github.event_name != 'schedule' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
     name: Roblox (Open Cloud)
     runs-on: ubuntu-latest
     environment: testing
@@ -65,9 +73,9 @@ jobs:
       group: luau-execution
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          persist-credentials: false
 
       - uses: kohltastrophe/sert/actions/setup@v0.1.0
 
@@ -87,9 +95,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
+          persist-credentials: false
 
       - uses: kohltastrophe/sert/actions/setup@v0.1.0
         with:

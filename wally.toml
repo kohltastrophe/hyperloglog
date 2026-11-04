@@ -1,0 +1,12 @@
+[package]
+name = "kohltastrophe/hyperloglog"
+description = "Efficient HyperLogLog++ cardinality estimator for Luau."
+version = "0.1.0"
+license = "MIT"
+authors = ["Kohl <kohl@kohl.gg> (https://github.com/kohltastrophe)"]
+realm = "shared"
+registry = "https://github.com/UpliftGames/wally-index"
+include = ["default.project.json", "LICENSE.md", "src", "src/**", "wally.toml"]
+exclude = ["*"]
+
+[dependencies]
