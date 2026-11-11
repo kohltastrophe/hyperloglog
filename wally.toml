@@ -1,7 +1,7 @@
 [package]
 name = "kohltastrophe/hyperloglog"
 description = "Efficient HyperLogLog++ cardinality estimator for Luau."
-version = "0.1.0"
+version = "0.2.0"
 license = "MIT"
 authors = ["Kohl <kohl@kohl.gg> (https://github.com/kohltastrophe)"]
 realm = "shared"
