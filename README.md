@@ -2,12 +2,12 @@
 
 [![CI](https://img.shields.io/github/actions/workflow/status/kohltastrophe/hyperloglog/ci.yml?style=for-the-badge)](https://github.com/kohltastrophe/hyperloglog/actions/workflows/ci.yml) [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/kohltastrophe/hyperloglog/badges/coverage.json&style=for-the-badge)](https://github.com/kohltastrophe/hyperloglog/actions/workflows/ci.yml) [![License](https://img.shields.io/github/license/kohltastrophe/hyperloglog?style=for-the-badge)](LICENSE.md)
 
-A HyperLogLog++ cardinality estimator for Luau. It counts distinct numbers, strings, and buffers using at most 16 KB of memory at the default precision (`p = 14`, ~0.81% standard error).
+A HyperLogLog++ cardinality estimator for Luau. It counts distinct numbers, strings, and buffers using at most 16 KB of register memory at the default precision (`p = 14`, ~0.81% standard error).
 
-- **Low memory:** Starts in a compact sparse list for small counts and promotes to a fixed `1 + 2^p` byte `buffer` once more than $m / 4$ registers are set.
+- **Low memory:** Starts in a compact sparse `buffer` for small sets and promotes to a fixed `1 + 2^p` byte `buffer` once more than $3m / 16$ registers are set.
 - **Accurate across all sizes:** Uses LinearCounting for small sets and HyperLogLog++ bias correction below $5m$ across all precisions ($p \in [4, 18]$).
 - **Built-in serialization:** [`serialize`](#hyperloglogserialize) and [`deserialize`](#hyperloglogdeserializedata) pack and validate estimators into a standalone `buffer` for `DataStore` or `MessagingService`.
-- **Cross-server merging:** [`merge`](#hyperloglogmergeother) combines estimators of matching precision in place.
+- **Cross-server merging:** [`merge`](#hyperloglogmergeother), [`clone`](#hyperloglogclone), and [`clear`](#hyperloglogclear) combine, copy, and reset estimators for multi-server and rolling-window metrics.
 
 ## Quick Start
 
@@ -26,21 +26,22 @@ print(serverA:estimate()) --> ~10001
 local payload = serverA:serialize()
 local restored = HyperLogLog.deserialize(payload)
 
--- Merge counts from another server
+-- Merge counts from another server without mutating serverA
 local serverB = HyperLogLog.new(14)
 for userId = 5_001, 15_000 do
 	serverB:add(userId)
 end
 
 if restored then
-	restored:merge(serverB)
-	print(restored:estimate()) --> ~15001
+	local combined = restored:clone()
+	combined:merge(serverB)
+	print(combined:estimate()) --> ~15001
 end
 ```
 
 ## Precision, Memory & Standard Error
 
-Pass a precision `p` from `4` to `18` to choose your memory and accuracy trade-off ($m = 2^p$ registers). Estimators start in a compact sparse list and switch to a fixed `1 + m` byte `buffer` once more than $m / 4$ registers are set.
+Pass a precision `p` from `4` to `18` to choose your memory and accuracy trade-off ($m = 2^p$ registers). Estimators start in an open-addressed sparse `buffer` (at most `m` bytes) and switch to a fixed `1 + m` byte dense `buffer` once more than $3m / 16$ sparse registers are set.
 
 | Precision (`p`) | Registers (`m = 2^p`) | Dense Memory (`1 + m`) | Standard Error (`1.04 / sqrt(m)`) |
 | :--- | :--- | :--- | :--- |
@@ -58,7 +59,7 @@ Pass a precision `p` from `4` to `18` to choose your memory and accuracy trade-o
 function HyperLogLog.new(precision: number?): HyperLogLog
 ```
 
-Creates an empty `HyperLogLog` estimator. `precision` is floored and clamped to `[4, 18]` and defaults to `14`.
+Creates an empty `HyperLogLog` estimator. `precision` is floored and clamped to `[4, 18]`, defaulting to `14` when omitted or `NaN`.
 
 ### `HyperLogLog:add(item)`
 
@@ -66,7 +67,7 @@ Creates an empty `HyperLogLog` estimator. `precision` is floored and clamped to 
 function HyperLogLog:add(item: buffer | number | string): ()
 ```
 
-Adds a number, string, or buffer to the estimator. Numbers are hashed as 64-bit floats, so `1` and `1.0` count as the same item. Strings and buffers are hashed by their raw bytes, so `"abc"` and `buffer.fromstring("abc")` also match.
+Adds a number, string, or buffer to the estimator. Numbers are hashed as little-endian 64-bit floats (`-0` matches `0`, and `NaN` values share one canonical hash). Strings and buffers are hashed by their raw bytes, so `"abc"` and `buffer.fromstring("abc")` count as the same item.
 
 ### `HyperLogLog:estimate()`
 
@@ -84,13 +85,29 @@ function HyperLogLog:merge(other: HyperLogLog): ()
 
 Merges `other` into `self` in place so `self:estimate()` reflects the union of both estimators. Throws an error if `self` and `other` have different precisions.
 
+### `HyperLogLog:clone()`
+
+```luau
+function HyperLogLog:clone(): HyperLogLog
+```
+
+Returns an independent copy of the estimator. Mutating the copy doesn't affect `self`.
+
+### `HyperLogLog:clear()`
+
+```luau
+function HyperLogLog:clear(): ()
+```
+
+Resets the estimator back to empty in place so `self:estimate()` returns `0`.
+
 ### `HyperLogLog:serialize()`
 
 ```luau
 function HyperLogLog:serialize(): buffer
 ```
 
-Packs the estimator into a standalone `buffer` for storage or network transport. Dense estimators take `1 + 2^p` bytes, and sparse estimators varint-compress their active registers.
+Packs the estimator into a standalone `buffer` for storage or network transport. Dense estimators take `1 + 2^p` bytes, and sparse estimators delta-compress their active registers with varints.
 
 ### `HyperLogLog.deserialize(data)`
 
