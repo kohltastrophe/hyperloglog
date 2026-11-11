@@ -6,18 +6,19 @@
 -- Documentation: https://github.com/kohltastrophe/HyperLogLog
 -- Reference: https://research.google.com/pubs/archive/40671.pdf
 
--- Pre-computed lookup table for the estimate loop (ranks 0 .. 61)
+-- Pre-computed lookup table for register rank powers (ranks 0 .. 61)
 local POW_2_NEG = table.create(62) :: { number }
 for i = 0, 61 do
 	POW_2_NEG[i + 1] = 2 ^ -i
 end
+table.freeze(POW_2_NEG)
 
--- Pre-computed 16-bit two-register harmonic sum lookup table (v1 + v2 * 256 + 1 -> 2^-v1 + 2^-v2)
-local SUM_16 = table.create(16384, 0) :: { number }
+-- Pre-computed two-register harmonic sum lookup buffer ((v1 + v2 * 256) * 8 -> f64 of 2^-v1 + 2^-v2)
+local SUM_16_BUF = buffer.create(16384 * 8)
 for v1 = 0, 63 do
 	local p1 = 2 ^ -v1
 	for v2 = 0, 63 do
-		SUM_16[v1 + v2 * 256 + 1] = p1 + 2 ^ -v2
+		buffer.writef64(SUM_16_BUF, (v1 + v2 * 256) * 8, p1 + 2 ^ -v2)
 	end
 end
 
@@ -944,20 +945,24 @@ local SLOPE_DATA = table.create(MAXIMUM_PRECISION - MINIMUM_PRECISION + 1) :: { 
 for idx = 1, MAXIMUM_PRECISION - MINIMUM_PRECISION + 1 do
 	local means = MEAN_DATA[idx]
 	local biases = BIAS_DATA[idx]
+	table.freeze(means)
+	table.freeze(biases)
 	local n = #means
 	local slopes = table.create(n) :: { number }
 	slopes[1] = 0
 	for i = 2, n do
 		slopes[i] = (biases[i] - biases[i - 1]) / (means[i] - means[i - 1])
 	end
-	SLOPE_DATA[idx] = slopes
+	SLOPE_DATA[idx] = table.freeze(slopes)
 end
+table.freeze(SLOPE_DATA)
 
--- Sparse mode uses precision p' = 25 so ranks fit in 6 bits (1..40) for varint packing
+-- Sparse mode uses precision p' = 25 inside an open-addressed u32 buffer (<= m bytes at 0.75 max load)
 local SPARSE_PRECISION = 25
 local SPARSE_REGISTERS = 2 ^ SPARSE_PRECISION
 local SPARSE_MAX_RHO = 64 - SPARSE_PRECISION + 1
-local DENSE_THRESHOLD_RATIO = 0.25
+local INITIAL_SPARSE_BYTES = 128
+local MAX_SCRATCH_BYTES = 16384
 
 -- Linear counting is used below these empirically determined cardinalities
 local COUNTING_THRESHOLD = table.freeze({
@@ -981,10 +986,23 @@ local COUNTING_THRESHOLD = table.freeze({
 local SEED_A = 0xDEADBEEF
 local SEED_B = 0x9E3779B9
 local SEED_C = 0x85EBCA6B
+local CANONICAL_NAN_HI = 0x7FF80000
 
-local tail = buffer.create(12)
+local fastBuf = buffer.create(12)
 local scratchLen = 1024
 local scratch = buffer.create(scratchLen)
+
+local function acquireScratch(minBytes: number): buffer
+	if minBytes <= scratchLen then
+		return scratch
+	end
+	if minBytes <= MAX_SCRATCH_BYTES then
+		scratchLen = bit32.lshift(1, 32 - bit32.countlz(minBytes - 1))
+		scratch = buffer.create(scratchLen)
+		return scratch
+	end
+	return buffer.create(minBytes)
+end
 
 local function getAlpha(m: number): number
 	if m == 16 then
@@ -1036,58 +1054,31 @@ export type HLL = {
 	m: number,
 	alpha: number, -- alpha_m * m^2
 	buffer: buffer?, -- Dense registers after a precision byte
-	sparse_registers: { number }?, -- Packed `index * 64 + rho` sparse entries
-	sparse_count: number,
-	_dirty: boolean?,
+	_sparse: buffer?, -- Open-addressed u32 table of packed `index * 64 + rho` entries (`0` = empty)
+	_count: number, -- Active sparse entry count
 	_sum: number?,
 	_zeros: number?,
 }
 export type HyperLogLog = typeof(setmetatable({} :: HLL, HyperLogLog))
 
--- Sorts and deduplicates buffered sparse entries in place, keeping the maximum rho per sparse index
-local function flushSparse(hll: HyperLogLog): number
-	if not hll._dirty then
-		return hll.sparse_count
-	end
-
-	local list = hll.sparse_registers :: { number }
-	local len = #list
-	table.sort(list)
-
-	local rshift = bit32.rshift
-	local out = 1
-	local prev = list[1]
-	local prevIdx = rshift(prev, 6)
-	for i = 2, len do
-		local v = list[i]
-		if v ~= prev then
-			local idx = rshift(v, 6)
-			if idx == prevIdx then
-				-- Sorted ascending: `v > prev` has the larger rho for the same sparse index
-				list[out] = v
-			else
-				out += 1
-				list[out] = v
-				prevIdx = idx
-			end
-			prev = v
-		end
-	end
-
-	for i = out + 1, len do
-		list[i] = nil
-	end
-
-	hll.sparse_count = out
-	hll._dirty = false
-	return out
+local function newRaw(p: number, sparse: buffer?): HyperLogLog
+	local m = 2 ^ p
+	local hll: HLL = {
+		p = p,
+		m = m,
+		alpha = getAlpha(m) * m ^ 2,
+		buffer = nil,
+		_sparse = sparse,
+		_count = 0,
+		_sum = nil,
+		_zeros = nil,
+	}
+	return setmetatable(hll, HyperLogLog)
 end
 
--- Folds sparse p' = 25 registers into dense precision p registers. When the middle (25 - p)
--- index bits are all zero, the leading-zero run continues into the sparse rho.
-local function foldSparseHLL(dst: HyperLogLog, src: HyperLogLog)
-	local b = dst.buffer :: buffer
-	local p = dst.p
+-- Folds sparse p' = 25 entries from `sparseBuf[startOff .. endOff - 4]` into dense precision `p` registers.
+-- When the lower (25 - p) index bits are all zero, the leading-zero run continues into the 6-bit sparse rho.
+local function foldSparseBuffer(dstBuf: buffer, p: number, sparseBuf: buffer, startOff: number, endOff: number)
 	local diff = SPARSE_PRECISION - p
 	local shift = 32 - diff
 	local indexShift = diff + 6
@@ -1095,91 +1086,122 @@ local function foldSparseHLL(dst: HyperLogLog, src: HyperLogLog)
 	local rshift = bit32.rshift
 	local lshift = bit32.lshift
 	local countlz = bit32.countlz
+	local readu32 = buffer.readu32
 	local readu8 = buffer.readu8
 	local writeu8 = buffer.writeu8
-	local lookup = POW_2_NEG
 
-	local sum = dst._sum
-	local zeros = dst._zeros or 0
-
-	local list = src.sparse_registers :: { number }
-	for i = 1, #list do
-		local val = list[i]
-		local residual = lshift(rshift(val, 6), shift)
-		local rho = if residual == 0 then band(val, 63) + diff else countlz(residual) + 1
-
-		local index = rshift(val, indexShift) + 1
-		local old = readu8(b, index)
-		if rho > old then
-			writeu8(b, index, rho)
-			if sum then
-				sum += lookup[rho + 1] - lookup[old + 1]
-				if old == 0 then
-					zeros -= 1
-				end
+	for off = startOff, endOff - 4, 4 do
+		local val = readu32(sparseBuf, off)
+		if val ~= 0 then
+			local residual = lshift(rshift(val, 6), shift)
+			local rho = if residual == 0 then band(val, 63) + diff else countlz(residual) + 1
+			local index = rshift(val, indexShift) + 1
+			local old = readu8(dstBuf, index)
+			if rho > old then
+				writeu8(dstBuf, index, rho)
 			end
 		end
 	end
-
-	if sum then
-		dst._sum = sum
-		dst._zeros = zeros
-	end
 end
 
-local function newRaw(p: number, sparseRegisters: { number }?): HyperLogLog
-	local m = 2 ^ p
-	local hll: HLL = {
-		p = p,
-		m = m,
-		alpha = getAlpha(m) * m ^ 2,
-		buffer = nil,
-		sparse_registers = sparseRegisters,
-		sparse_count = 0,
-		_dirty = if sparseRegisters then false else nil,
-		_sum = nil,
-		_zeros = nil,
-	}
-	return setmetatable(hll, HyperLogLog)
-end
-
-local function toDense(hll: HyperLogLog)
+local function promoteToDense(hll: HyperLogLog)
 	local m = hll.m
 	local b = buffer.create(1 + m)
 	buffer.writeu8(b, 0, hll.p)
+	local sb = hll._sparse :: buffer
+	foldSparseBuffer(b, hll.p, sb, 0, buffer.len(sb))
 
 	hll.buffer = b
-	hll._sum = m
-	hll._zeros = m
+	hll._sparse = nil
+	hll._count = 0
+end
 
-	foldSparseHLL(hll, hll)
+local function growSparse(hll: HyperLogLog)
+	local oldBuf = hll._sparse :: buffer
+	local oldBytes = buffer.len(oldBuf)
+	local newBytes = math.min(hll.m, oldBytes * 4)
+	local newMask = newBytes - 4
+	local newBuf = buffer.create(newBytes)
+	local readu32 = buffer.readu32
+	local writeu32 = buffer.writeu32
+	local band = bit32.band
+	local bxor = bit32.bxor
+	local rshift = bit32.rshift
 
-	hll.sparse_registers = nil
-	hll.sparse_count = 0
+	for off = 0, oldBytes - 4, 4 do
+		local entry = readu32(oldBuf, off)
+		if entry ~= 0 then
+			local idx = rshift(entry, 6)
+			local slot = band(bxor(idx, rshift(idx, 13)) * 4, newMask)
+			while readu32(newBuf, slot) ~= 0 do
+				slot = band(slot + 4, newMask)
+			end
+			writeu32(newBuf, slot, entry)
+		end
+	end
+
+	hll._sparse = newBuf
+end
+
+local function insertSparseEntry(hll: HyperLogLog, sb: buffer, index: number, entry: number)
+	local readu32 = buffer.readu32
+	local writeu32 = buffer.writeu32
+	local band = bit32.band
+	local rshift = bit32.rshift
+
+	local capBytes = buffer.len(sb)
+	local byteMask = capBytes - 4
+	local slot = band(bit32.bxor(index, rshift(index, 13)) * 4, byteMask)
+
+	while true do
+		local cur = readu32(sb, slot)
+		if cur == 0 then
+			writeu32(sb, slot, entry)
+			local count = hll._count + 1
+			hll._count = count
+			if count * 16 > capBytes * 3 then
+				if capBytes >= hll.m then
+					promoteToDense(hll)
+				else
+					growSparse(hll)
+				end
+			end
+			return
+		elseif rshift(cur, 6) == index then
+			if entry > cur then
+				writeu32(sb, slot, entry)
+			end
+			return
+		end
+		slot = band(slot + 4, byteMask)
+	end
 end
 
 --[[
-Creates a new [HyperLogLog] estimator. `precision` is clamped to `[4, 18]` and defaults to `14` (`16,384` registers).
+Creates a new [HyperLogLog] estimator. `precision` is floored and clamped to `[4, 18]` and defaults to `14`.
 ]]
 function HyperLogLog.new(precision: number?): HyperLogLog
-	local p = math.clamp(math.floor(precision or DEFAULT_PRECISION), MINIMUM_PRECISION, MAXIMUM_PRECISION)
-	return newRaw(p, {})
+	local p = if precision and precision == precision
+		then math.clamp(math.floor(precision), MINIMUM_PRECISION, MAXIMUM_PRECISION)
+		else DEFAULT_PRECISION
+	local initBytes = math.min(2 ^ p, INITIAL_SPARSE_BYTES)
+	return newRaw(p, buffer.create(initBytes))
 end
 
--- 64-bit ARX block mixer (Bob Jenkins' lookup3)
-local function mixBlocksLookup3(
-	buf: buffer,
-	lastBlock: number,
-	a: number,
-	b: number,
-	c: number
-): (number, number, number)
+-- 64-bit lookup3 block mixer with overlapping final 12-byte read for inputs > 12 bytes
+local function hashLongBuf(buf: buffer, len: number): (number, number, number)
 	local bxor = bit32.bxor
 	local lrotate = bit32.lrotate
+	local bor = bit32.bor
 	local readu32 = buffer.readu32
 
+	local a = SEED_A + len
+	local b = SEED_B + len
+	local c = SEED_C + len
+
+	local limit = len - 12
 	local offset = 0
-	while offset < lastBlock do
+	while offset < limit do
 		a += readu32(buf, offset)
 		b += readu32(buf, offset + 4)
 		c += readu32(buf, offset + 8)
@@ -1193,33 +1215,16 @@ local function mixBlocksLookup3(
 		a = bxor(a - c, lrotate(c, 16))
 		c += b
 		b = bxor(b - a, lrotate(a, 19))
-		a += c
+		a = bor(a + c, 0)
 		c = bxor(c - b, lrotate(b, 4))
-		b += a
+		b = bor(b + a, 0)
 
 		offset += 12
 	end
 
-	return a, b, c
-end
-
-local function mixStringLookup3(item: string, len: number, a: number, b: number, c: number): (number, number, number)
-	local needed = len + 12
-	if needed > scratchLen then
-		scratchLen = needed * 2
-		scratch = buffer.create(scratchLen)
-	end
-	local buf = scratch
-	local lastBlock = (len // 12) * 12
-	buffer.writef64(buf, lastBlock, 0)
-	buffer.writeu32(buf, lastBlock + 8, 0)
-	buffer.writestring(buf, 0, item)
-	a, b, c = mixBlocksLookup3(buf, lastBlock, a, b, c)
-	if len > lastBlock then
-		a += buffer.readu32(buf, lastBlock)
-		b += buffer.readu32(buf, lastBlock + 4)
-		c += buffer.readu32(buf, lastBlock + 8)
-	end
+	a += readu32(buf, limit)
+	b += readu32(buf, limit + 4)
+	c += readu32(buf, limit + 8)
 	return a, b, c
 end
 
@@ -1229,98 +1234,125 @@ Adds a number, string, or buffer to the estimator.
 function HyperLogLog.add(self: HyperLogLog, item: buffer | number | string)
 	local bxor = bit32.bxor
 	local lrotate = bit32.lrotate
-	local bor = bit32.bor
+	local rshift = bit32.rshift
+	local lshift = bit32.lshift
+	local countlz = bit32.countlz
 	local readu32 = buffer.readu32
 
 	local a: number, b: number, c: number
 	if type(item) == "number" then
-		buffer.writef64(tail, 0, item + 0)
-		a = (SEED_A + 8) + readu32(tail, 0)
-		b = (SEED_B + 8) + readu32(tail, 4)
+		if item == item then
+			buffer.writef64(fastBuf, 0, item + 0)
+			a = (SEED_A + 8) + readu32(fastBuf, 0)
+			b = (SEED_B + 8) + readu32(fastBuf, 4)
+		else
+			a = SEED_A + 8
+			b = (SEED_B + 8) + CANONICAL_NAN_HI
+		end
 		c = SEED_C + 8
 	elseif type(item) == "string" then
 		local len = #item
-		a = SEED_A + len
-		b = SEED_B + len
-		c = SEED_C + len
-		if len > 0 then
-			if len < 12 then
-				buffer.writef64(tail, 0, 0)
-				buffer.writeu32(tail, 8, 0)
-				buffer.writestring(tail, 0, item)
-				a += readu32(tail, 0)
-				b += readu32(tail, 4)
-				c += readu32(tail, 8)
-			else
-				a, b, c = mixStringLookup3(item, len, a, b, c)
+		if len <= 12 then
+			a = SEED_A + len
+			b = SEED_B + len
+			c = SEED_C + len
+			if len >= 4 then
+				buffer.writestring(fastBuf, 0, item)
+				a += readu32(fastBuf, 0)
+				if len <= 8 then
+					b += readu32(fastBuf, len - 4)
+				else
+					b += readu32(fastBuf, 4)
+					c += readu32(fastBuf, len - 4)
+				end
+			elseif len > 0 then
+				local b0, b1, b2 = string.byte(item, 1, 3)
+				local mid = if len == 1 then b0 else b1
+				local last = if len == 1 then b0 elseif len == 2 then b1 else b2
+				a += b0 + lshift(mid, 8) + lshift(last, 16)
 			end
+		else
+			local buf = acquireScratch(len)
+			buffer.writestring(buf, 0, item)
+			a, b, c = hashLongBuf(buf, len)
 		end
 	else
 		local len = buffer.len(item)
-		local lastBlock = (len // 12) * 12
-		a, b, c = mixBlocksLookup3(item, lastBlock, SEED_A + len, SEED_B + len, SEED_C + len)
-		local rem = len - lastBlock
-		if rem > 0 then
-			buffer.writef64(tail, 0, 0)
-			buffer.writeu32(tail, 8, 0)
-			buffer.copy(tail, 0, item, lastBlock, rem)
-			a += readu32(tail, 0)
-			b += readu32(tail, 4)
-			c += readu32(tail, 8)
+		if len <= 12 then
+			a = SEED_A + len
+			b = SEED_B + len
+			c = SEED_C + len
+			if len >= 4 then
+				a += readu32(item, 0)
+				if len <= 8 then
+					b += readu32(item, len - 4)
+				else
+					b += readu32(item, 4)
+					c += readu32(item, len - 4)
+				end
+			elseif len > 0 then
+				a += buffer.readu8(item, 0) + lshift(buffer.readu8(item, rshift(len, 1)), 8) + lshift(
+					buffer.readu8(item, len - 1),
+					16
+				)
+			end
+		else
+			a, b, c = hashLongBuf(item, len)
 		end
 	end
 
-	-- 64-bit lookup3 final avalanche -> (hi = c, lo = b)
+	-- 64-bit lookup3 final avalanche -> hi first; lo is computed lazily only when rest == 0
 	c = bxor(c, b) - lrotate(b, 14)
 	a = bxor(a, c) - lrotate(c, 11)
 	b = bxor(b, a) - lrotate(a, 25)
 	c = bxor(c, b) - lrotate(b, 16)
 	a = bxor(a, c) - lrotate(c, 4)
 	b = bxor(b, a) - lrotate(a, 14)
-	local hi = bor(bxor(c, b) - lrotate(b, 24), 0)
-	a = bxor(a, hi) - lrotate(hi, 11)
-	local lo = bor(bxor(b, a) - lrotate(a, 25), 0)
+	local hi = bxor(c, b) - lrotate(b, 24)
 
 	local regBuf = self.buffer
 	if regBuf then
 		local p = self.p
-		local index = bit32.rshift(hi, 32 - p) + 1
-		local rest = bit32.lshift(hi, p)
-		local rho = if rest ~= 0 then bit32.countlz(rest) + 1 else 33 - p + bit32.countlz(lo)
+		local index = rshift(hi, 32 - p) + 1
+		local rest = lshift(hi, p)
+		local rho: number
+		if rest ~= 0 then
+			rho = countlz(rest) + 1
+		else
+			a = bxor(a, hi) - lrotate(hi, 11)
+			local lo = bxor(b, a) - lrotate(a, 25)
+			rho = 33 - p + countlz(lo)
+		end
 
 		local old = buffer.readu8(regBuf, index)
 		if rho > old then
 			buffer.writeu8(regBuf, index, rho)
 			local sum = self._sum
 			if sum then
-				self._sum = sum + POW_2_NEG[rho + 1] - POW_2_NEG[old + 1]
+				self._sum = sum + (POW_2_NEG[rho + 1] - POW_2_NEG[old + 1])
 				if old == 0 then
 					self._zeros = (self._zeros :: number) - 1
 				end
 			end
 		end
 	else
-		local index = bit32.rshift(hi, 32 - SPARSE_PRECISION)
-		local rest = bit32.lshift(hi, SPARSE_PRECISION)
-		local rho = if rest ~= 0 then bit32.countlz(rest) + 1 else 33 - SPARSE_PRECISION + bit32.countlz(lo)
-
-		local list = self.sparse_registers :: { number }
-		local entry = index * 64 + rho
-		local len = #list
-		if list[len] == entry then
-			return
-		end
-		len += 1
-		list[len] = entry
-		if len == 1 then
-			self.sparse_count = 1
+		local p = self.p
+		local index = rshift(hi, 32 - SPARSE_PRECISION)
+		local rho: number
+		if bit32.band(index, lshift(1, SPARSE_PRECISION - p) - 1) ~= 0 then
+			rho = 1
 		else
-			self._dirty = true
-			local threshold = self.m * DENSE_THRESHOLD_RATIO
-			if len > threshold and flushSparse(self) > threshold then
-				toDense(self)
+			local rest = lshift(hi, SPARSE_PRECISION)
+			if rest ~= 0 then
+				rho = countlz(rest) + 1
+			else
+				a = bxor(a, hi) - lrotate(hi, 11)
+				local lo = bxor(b, a) - lrotate(a, 25)
+				rho = 33 - SPARSE_PRECISION + countlz(lo)
 			end
 		end
+
+		insertSparseEntry(self, self._sparse :: buffer, index, index * 64 + rho)
 	end
 end
 
@@ -1328,10 +1360,8 @@ end
 Returns the estimated number of distinct items added so far, rounded to the nearest integer.
 ]]
 function HyperLogLog.estimate(self: HyperLogLog): number
-	if self.sparse_registers then
-		local count = flushSparse(self)
-		-- Linear counting over the sparse registers, which are far from full before switching to dense
-		local nZeros = SPARSE_REGISTERS - count
+	if self._sparse then
+		local nZeros = SPARSE_REGISTERS - self._count
 		return math.round(SPARSE_REGISTERS * math.log(SPARSE_REGISTERS / nZeros))
 	end
 
@@ -1344,26 +1374,43 @@ function HyperLogLog.estimate(self: HyperLogLog): number
 		sum = self._sum
 		nZeros = self._zeros :: number
 	else
-		sum = 0
-		nZeros = 0
-		local sum16 = SUM_16
+		local sum0, sum1 = 0, 0
+		local nonZeros = 0
+		local sumBuf = SUM_16_BUF
 		local readu32 = buffer.readu32
+		local readf64 = buffer.readf64
 		local band = bit32.band
+		local lshift = bit32.lshift
 		local rshift = bit32.rshift
-		local bnot = bit32.bnot
 
 		for block = 1, m, 256 do
-			local zacc = 0
-			local blockEnd = if block + 252 <= m then block + 252 else m - 3
-			for i = block, blockEnd, 4 do
-				local chunk = readu32(b, i)
-				sum += sum16[band(chunk, 0xFFFF) + 1] + sum16[rshift(chunk, 16) + 1]
-				zacc += rshift(band(bnot(chunk + 0x7F7F7F7F), 0x80808080), 7)
+			local nzacc = 0
+			local blockEnd = if block + 240 <= m then block + 240 else m - 15
+			for i = block, blockEnd, 16 do
+				local c0 = readu32(b, i)
+				local c1 = readu32(b, i + 4)
+				local c2 = readu32(b, i + 8)
+				local c3 = readu32(b, i + 12)
+				sum0 += readf64(sumBuf, lshift(band(c0, 0xFFFF), 3)) + readf64(sumBuf, lshift(rshift(c0, 16), 3)) + readf64(
+					sumBuf,
+					lshift(band(c1, 0xFFFF), 3)
+				) + readf64(sumBuf, lshift(rshift(c1, 16), 3))
+				sum1 += readf64(sumBuf, lshift(band(c2, 0xFFFF), 3)) + readf64(sumBuf, lshift(rshift(c2, 16), 3)) + readf64(
+					sumBuf,
+					lshift(band(c3, 0xFFFF), 3)
+				) + readf64(sumBuf, lshift(rshift(c3, 16), 3))
+				nzacc += band(c0 + 0x7F7F7F7F, 0x80808080) + band(c1 + 0x7F7F7F7F, 0x80808080) + band(
+					c2 + 0x7F7F7F7F,
+					0x80808080
+				) + band(c3 + 0x7F7F7F7F, 0x80808080)
 			end
-			zacc += rshift(zacc, 16)
-			nZeros += band(zacc, 0xFF) + band(rshift(zacc, 8), 0xFF)
+			local z = nzacc / 128
+			z += rshift(z, 16)
+			nonZeros += band(z, 0xFF) + band(rshift(z, 8), 0xFF)
 		end
 
+		sum = sum0 + sum1
+		nZeros = m - nonZeros
 		self._sum = sum
 		self._zeros = nZeros
 	end
@@ -1390,33 +1437,65 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 	if self.p ~= other.p then
 		error("Cannot merge HyperLogLog objects with different precision")
 	end
+	if self == other then
+		return
+	end
 
-	local otherSparse = other.sparse_registers
+	local otherSparse = other._sparse
 	if otherSparse then
-		local selfSparse = self.sparse_registers
-		if not selfSparse then
-			foldSparseHLL(self, other)
+		if not self._sparse then
+			if other._count > 0 then
+				foldSparseBuffer(self.buffer :: buffer, self.p, otherSparse, 0, buffer.len(otherSparse))
+				self._sum = nil
+			end
 			return
 		end
 
-		local srcLen = #otherSparse
-		if srcLen > 0 then
-			local dstLen = #selfSparse
-			table.move(otherSparse, 1, srcLen, dstLen + 1, selfSparse)
-			self._dirty = true
+		if other._count == 0 then
+			return
+		end
+		if self._count == 0 then
+			local b = buffer.create(buffer.len(otherSparse))
+			buffer.copy(b, 0, otherSparse)
+			self._sparse = b
+			self._count = other._count
+			return
 		end
 
-		if flushSparse(self) > self.m * DENSE_THRESHOLD_RATIO then
-			toDense(self)
+		local otherBytes = buffer.len(otherSparse)
+		local readu32 = buffer.readu32
+		local rshift = bit32.rshift
+		for off = 0, otherBytes - 4, 4 do
+			local entry = readu32(otherSparse, off)
+			if entry ~= 0 then
+				insertSparseEntry(self, self._sparse :: buffer, rshift(entry, 6), entry)
+				if not self._sparse then
+					foldSparseBuffer(self.buffer :: buffer, self.p, otherSparse, off + 4, otherBytes)
+					return
+				end
+			end
 		end
 		return
 	end
 
-	if self.sparse_registers then
-		toDense(self)
+	local selfSparse = self._sparse
+	if selfSparse then
+		local b = buffer.create(1 + self.m)
+		buffer.copy(b, 0, other.buffer :: buffer)
+		self.buffer = b
+		self._sparse = nil
+		local count = self._count
+		self._count = 0
+		if count == 0 then
+			self._sum = other._sum
+			self._zeros = other._zeros
+		else
+			foldSparseBuffer(b, self.p, selfSparse, 0, buffer.len(selfSparse))
+		end
+		return
 	end
 
-	-- Dense + Dense: SWAR 4-byte parallel register-wise maximum
+	-- Dense + Dense: 2x-unrolled SWAR 4-byte parallel register-wise maximum
 	local b1 = self.buffer :: buffer
 	local b2 = other.buffer :: buffer
 	local readu32 = buffer.readu32
@@ -1427,14 +1506,24 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 	local rshift = bit32.rshift
 	local modified = false
 
-	for i = 1, self.m, 4 do
-		local x = readu32(b1, i)
-		local y = readu32(b2, i)
-		if x ~= y then
-			local ge = band(bor(x, 0x80808080) - y, 0x80808080)
+	for i = 1, self.m, 8 do
+		local x0 = readu32(b1, i)
+		local y0 = readu32(b2, i)
+		if x0 ~= y0 then
+			local ge = band(bor(x0, 0x80808080) - y0, 0x80808080)
 			if ge ~= 0x80808080 then
 				local mask = ge - rshift(ge, 7)
-				writeu32(b1, i, bxor(y, band(bxor(x, y), mask)))
+				writeu32(b1, i, bxor(y0, band(bxor(x0, y0), mask)))
+				modified = true
+			end
+		end
+		local x1 = readu32(b1, i + 4)
+		local y1 = readu32(b2, i + 4)
+		if x1 ~= y1 then
+			local ge = band(bor(x1, 0x80808080) - y1, 0x80808080)
+			if ge ~= 0x80808080 then
+				local mask = ge - rshift(ge, 7)
+				writeu32(b1, i + 4, bxor(y1, band(bxor(x1, y1), mask)))
 				modified = true
 			end
 		end
@@ -1446,43 +1535,117 @@ function HyperLogLog.merge(self: HyperLogLog, other: HyperLogLog)
 end
 
 --[[
+Returns an independent copy of the estimator.
+]]
+function HyperLogLog.clone(self: HyperLogLog): HyperLogLog
+	local copy = newRaw(self.p, nil)
+	local regBuf = self.buffer
+	if regBuf then
+		local b = buffer.create(buffer.len(regBuf))
+		buffer.copy(b, 0, regBuf)
+		copy.buffer = b
+		copy._sum = self._sum
+		copy._zeros = self._zeros
+	else
+		local sb = self._sparse :: buffer
+		local b = buffer.create(buffer.len(sb))
+		buffer.copy(b, 0, sb)
+		copy._sparse = b
+		copy._count = self._count
+	end
+	return copy
+end
+
+--[[
+Resets the estimator back to empty in place.
+]]
+function HyperLogLog.clear(self: HyperLogLog)
+	local initBytes = math.min(self.m, INITIAL_SPARSE_BYTES)
+	local sb = self._sparse
+	if sb and buffer.len(sb) == initBytes then
+		buffer.fill(sb, 0, 0)
+	else
+		self._sparse = buffer.create(initBytes)
+	end
+	self.buffer = nil
+	self._count = 0
+	self._sum = nil
+	self._zeros = nil
+end
+
+local function writeVarInt(buf: buffer, offset: number, val: number): number
+	while val >= 128 do
+		buffer.writeu8(buf, offset, bit32.band(val, 127) + 128)
+		offset += 1
+		val = bit32.rshift(val, 7)
+	end
+	buffer.writeu8(buf, offset, val)
+	return offset + 1
+end
+
+--[[
 Serializes the estimator into a standalone `buffer`.
 ]]
 function HyperLogLog.serialize(self: HyperLogLog): buffer
-	local values = self.sparse_registers
-	if not values then
+	local sb = self._sparse
+	if not sb then
 		local b = buffer.create(1 + self.m)
 		buffer.copy(b, 0, self.buffer :: buffer)
 		return b
 	end
 
-	local count = flushSparse(self)
-	local maxBytes = 5 + count * 5
-	if maxBytes > scratchLen then
-		scratchLen = maxBytes * 2
-		scratch = buffer.create(scratchLen)
+	local count = self._count
+	if count == 0 then
+		local out = buffer.create(2)
+		buffer.writeu8(out, 0, self.p + 128)
+		return out
 	end
 
-	local buf = scratch
+	local entries = table.create(count) :: { number }
+	local n = 0
+	local readu32 = buffer.readu32
+	for off = 0, buffer.len(sb) - 4, 4 do
+		local entry = readu32(sb, off)
+		if entry ~= 0 then
+			n += 1
+			entries[n] = entry
+		end
+	end
+	if count > 1 then
+		table.sort(entries)
+	end
+
+	-- Header (1B) + count varint (<=4B) + per-entry deltaCode varint (<=4B) + optional rho (<=1B)
+	local buf = acquireScratch(5 + count * 5)
 	local writeu8 = buffer.writeu8
 	local band = bit32.band
 	local rshift = bit32.rshift
-	writeu8(buf, 0, self.p + 128)
-	buffer.writeu32(buf, 1, count)
+	local diffMask = bit32.lshift(1, SPARSE_PRECISION - self.p) - 1
 
-	local offset = 5
-	local prev = 0
+	writeu8(buf, 0, self.p + 128)
+	local offset = writeVarInt(buf, 1, count)
+	local prevIndex = -1
+
 	for i = 1, count do
-		local value = values[i]
-		local delta = value - prev
-		prev = value
-		while delta >= 128 do
-			writeu8(buf, offset, band(delta, 127) + 128)
+		local entry = entries[i]
+		local index = rshift(entry, 6)
+		local hasRho = if band(index, diffMask) == 0 then 1 else 0
+		local val = (index - prevIndex - 1) * 2 + hasRho
+		if val < 128 then
+			writeu8(buf, offset, val)
 			offset += 1
-			delta = rshift(delta, 7)
+		elseif val < 16384 then
+			writeu8(buf, offset, band(val, 127) + 128)
+			writeu8(buf, offset + 1, rshift(val, 7))
+			offset += 2
+		else
+			offset = writeVarInt(buf, offset, val)
 		end
-		writeu8(buf, offset, delta)
-		offset += 1
+		if hasRho == 1 then
+			writeu8(buf, offset, band(entry, 63))
+			offset += 1
+		end
+		prevIndex = index
 	end
 
 	local out = buffer.create(offset)
@@ -1490,59 +1653,139 @@ function HyperLogLog.serialize(self: HyperLogLog): buffer
 	return out
 end
 
--- Reads the sparse registers written by `serialize`, returning the sorted list and count or nil when malformed
-local function readSparse(data: buffer, len: number): ({ number }?, number)
-	if len < 5 then
-		return nil, 0
+-- Reads a 28-bit unsigned varint (up to 4 bytes), returning (value, nextOffset) or (-1, offset) when malformed
+local function readVarInt28(data: buffer, offset: number, len: number): (number, number)
+	local val = 0
+	local shift = 0
+	for _ = 1, 4 do
+		if offset >= len then
+			return -1, offset
+		end
+		local byte = buffer.readu8(data, offset)
+		offset += 1
+		if byte < 128 then
+			return val + bit32.lshift(byte, shift), offset
+		end
+		val += bit32.lshift(byte - 128, shift)
+		shift += 7
+	end
+	return -1, offset
+end
+
+-- Decodes HLL++ 1-bit flag sparse registers directly into `hll`, promoting to dense when `count` exceeds max load
+local function decodeSparseInto(hll: HyperLogLog, data: buffer, len: number): boolean
+	if len < 2 then
+		return false
 	end
 
-	local count = buffer.readu32(data, 1)
-	local list = table.create(math.min(count, len - 5)) :: { number }
-	local readu8 = buffer.readu8
+	local count, offset = readVarInt28(data, 1, len)
+	if count < 0 or count > SPARSE_REGISTERS or count > len - offset then
+		return false
+	end
+
+	local p = hll.p
+	local m = hll.m
+	local diff = SPARSE_PRECISION - p
+	local diffMask = bit32.lshift(1, diff) - 1
+	local shift = 32 - diff
 	local band = bit32.band
-	local offset = 5
-	local value = 0
-	local last_index = -1
+	local rshift = bit32.rshift
+	local lshift = bit32.lshift
+	local bxor = bit32.bxor
+	local readu8 = buffer.readu8
+	local readu32 = buffer.readu32
+	local writeu32 = buffer.writeu32
 
-	for i = 1, count do
-		local delta = 0
-		local mult = 1
-		local terminated = false
-		for _ = 1, 5 do
-			if offset >= len then
-				return nil, 0
-			end
-			local byte = readu8(data, offset)
+	local oversize = count * 16 > m * 3
+	local denseBuf: buffer? = nil
+	local sb: buffer? = nil
+	local byteMask = 0
+
+	if oversize then
+		local b = buffer.create(1 + m)
+		buffer.writeu8(b, 0, p)
+		denseBuf = b
+	else
+		local capBytes = math.min(m, INITIAL_SPARSE_BYTES)
+		while count * 16 > capBytes * 3 do
+			capBytes = math.min(m, capBytes * 4)
+		end
+		sb = buffer.create(capBytes)
+		byteMask = capBytes - 4
+	end
+
+	local prevIndex = -1
+	for _ = 1, count do
+		if offset >= len then
+			return false
+		end
+		local deltaCode = readu8(data, offset)
+		if deltaCode < 128 then
 			offset += 1
-			if byte < 128 then
-				delta += byte * mult
-				terminated = true
-				break
+		elseif offset + 1 < len then
+			local b1 = readu8(data, offset + 1)
+			if b1 < 128 then
+				deltaCode = (deltaCode - 128) + b1 * 128
+				offset += 2
+			else
+				deltaCode, offset = readVarInt28(data, offset, len)
+				if deltaCode < 0 then
+					return false
+				end
 			end
-			delta += (byte - 128) * mult
-			mult *= 128
+		else
+			return false
 		end
-		if not terminated then
-			return nil, 0
+		local hasRho = band(deltaCode, 1)
+		local index = prevIndex + 1 + rshift(deltaCode, 1)
+		if index >= SPARSE_REGISTERS then
+			return false
 		end
-
-		value += delta
-		local index = value // 64
-		local rho = band(value, 63)
-
-		-- Indices are strictly increasing, so every entry is a distinct register
-		if index <= last_index or index >= SPARSE_REGISTERS or rho == 0 or rho > SPARSE_MAX_RHO then
-			return nil, 0
+		if (hasRho == 1) ~= (band(index, diffMask) == 0) then
+			return false
 		end
 
-		list[i] = value
-		last_index = index
+		local rho = 1
+		if hasRho == 1 then
+			if offset >= len then
+				return false
+			end
+			rho = readu8(data, offset)
+			offset += 1
+			if rho == 0 or rho > SPARSE_MAX_RHO then
+				return false
+			end
+		end
+
+		if denseBuf then
+			local denseRho = if hasRho == 1 then rho + diff else bit32.countlz(lshift(index, shift)) + 1
+			local denseIdx = rshift(index, diff) + 1
+			local old = readu8(denseBuf, denseIdx)
+			if denseRho > old then
+				buffer.writeu8(denseBuf, denseIdx, denseRho)
+			end
+		else
+			local sparseBuf = sb :: buffer
+			local slot = band(bxor(index, rshift(index, 13)) * 4, byteMask)
+			while readu32(sparseBuf, slot) ~= 0 do
+				slot = band(slot + 4, byteMask)
+			end
+			writeu32(sparseBuf, slot, index * 64 + rho)
+		end
+		prevIndex = index
 	end
 
 	if offset ~= len then
-		return nil, 0
+		return false
 	end
-	return list, count
+
+	if denseBuf then
+		hll.buffer = denseBuf
+	else
+		hll._sparse = sb
+		hll._count = count
+	end
+	return true
 end
 
 --[[
@@ -1574,15 +1817,20 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 		local max_rho = 64 - p + 1
 		local addend = (127 - max_rho) * 0x01010101
 		local readu32 = buffer.readu32
-		local band = bit32.band
 		local bor = bit32.bor
+		local err = 0
 
-		for i = 1, m, 4 do
-			local chunk = readu32(data, i)
-			if band(bor(chunk, chunk + addend), 0x80808080) ~= 0 then
-				warn("Failed to deserialize HyperLogLog: invalid register value")
-				return nil
-			end
+		for i = 1, m, 16 do
+			local c0 = readu32(data, i)
+			local c1 = readu32(data, i + 4)
+			local c2 = readu32(data, i + 8)
+			local c3 = readu32(data, i + 12)
+			err = bor(err, bor(c0, c0 + addend), bor(c1, c1 + addend), bor(c2, c2 + addend), bor(c3, c3 + addend))
+		end
+
+		if bit32.band(err, 0x80808080) ~= 0 then
+			warn("Failed to deserialize HyperLogLog: invalid register value")
+			return nil
 		end
 
 		-- Copy so the counter never shares registers with the caller's buffer
@@ -1592,19 +1840,14 @@ function HyperLogLog.deserialize(data: buffer): HyperLogLog?
 		return hll
 	end
 
-	local list, count = readSparse(data, len)
-	if not list then
+	local hll = newRaw(p, nil)
+	if not decodeSparseInto(hll, data, len) then
 		warn("Failed to deserialize HyperLogLog: malformed sparse registers")
 		return nil
-	end
-
-	local hll = newRaw(p, list)
-	hll.sparse_count = count
-	if count > hll.m * DENSE_THRESHOLD_RATIO then
-		toDense(hll)
 	end
 
 	return hll
 end
 
+table.freeze(HyperLogLog)
 return HyperLogLog
