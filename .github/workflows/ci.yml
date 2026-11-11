@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: "ci-${{ github.ref }}-${{ startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release') && github.sha || '' }}"
-  cancel-in-progress: "${{ !startsWith(github.event.head_commit.message || github.event.pull_request.title, 'chore: release') }}"
+  group: ci-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
 
 defaults:
   run:
@@ -33,16 +33,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          fetch-depth: 0
           persist-credentials: false
 
       - uses: kohltastrophe/sert/actions/setup@v0.1.0
 
       - name: Conventional Commits and version check
-        uses: kohltastrophe/release@v1.0.0
+        uses: kohltastrophe/release@v1
         with:
           mode: check
-          pr-title: ${{ github.event.pull_request.title }}
 
       - name: sert lint
         run: python3 tools/sert.py lint
