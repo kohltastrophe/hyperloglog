@@ -36,7 +36,7 @@ local function makeDense(p: number, registers: { [number]: number }): buffer
 	return b
 end
 
-local function writeVarInt(bytes: { number }, value: number)
+local function appendVarInt(bytes: { number }, value: number)
 	while value >= 128 do
 		table.insert(bytes, value % 128 + 128)
 		value //= 128
@@ -44,10 +44,26 @@ local function writeVarInt(bytes: { number }, value: number)
 	table.insert(bytes, value)
 end
 
-local function makeSparse(p: number, count: number, deltas: { number }, extraBytes: { number }?): buffer
+-- Encodes sparse entries `{ { index, rho? }, ... }` using the HLL++ 1-bit rho flag format
+local function makeSparseEntries(
+	p: number,
+	entries: { { number } },
+	countOverride: number?,
+	extraBytes: { number }?
+): buffer
 	local bytes = {}
-	for _, delta in deltas do
-		writeVarInt(bytes, delta)
+	appendVarInt(bytes, countOverride or #entries)
+	local diffMask = bit32.lshift(1, 25 - p) - 1
+	local prevIndex = -1
+	for _, item in entries do
+		local index = item[1]
+		local rho = item[2]
+		local hasRho = if rho ~= nil then 1 elseif bit32.band(index, diffMask) == 0 then 1 else 0
+		appendVarInt(bytes, (index - prevIndex - 1) * 2 + hasRho)
+		if hasRho == 1 and rho ~= false then
+			table.insert(bytes, rho or 1)
+		end
+		prevIndex = index
 	end
 	if extraBytes then
 		for _, b in extraBytes do
@@ -55,33 +71,45 @@ local function makeSparse(p: number, count: number, deltas: { number }, extraByt
 		end
 	end
 
-	local b = buffer.create(5 + #bytes)
-	buffer.writeu8(b, 0, p + 128)
-	buffer.writeu32(b, 1, count)
+	local out = buffer.create(1 + #bytes)
+	buffer.writeu8(out, 0, p + 128)
 	for i, byte in bytes do
-		buffer.writeu8(b, 4 + i, byte)
+		buffer.writeu8(out, i, byte)
 	end
-	return b
+	return out
+end
+
+local function makeSparseRaw(p: number, payloadBytes: { number }): buffer
+	local out = buffer.create(1 + #payloadBytes)
+	buffer.writeu8(out, 0, p + 128)
+	for i, byte in payloadBytes do
+		buffer.writeu8(out, i, byte)
+	end
+	return out
 end
 
 local function toDenseCopy(HyperLogLog: any, hll: any)
-	local dense = HyperLogLog.new(hll.p)
-	dense.sparse_registers = nil
-	dense.buffer = makeDense(hll.p, {})
+	local dense = HyperLogLog.deserialize(makeDense(hll.p, {}))
 	dense:merge(hll)
 	return dense
 end
 
-sert.test("new · default, custom, and clamped precisions with alpha constants", function()
+sert.test("new · default, custom, clamped, and NaN precisions with frozen module", function()
 	local HyperLogLog = getHLL()
+	sert(table.isfrozen(HyperLogLog))
 
 	local hll = HyperLogLog.new()
 	sert.eq(hll.p, 14)
 	sert.eq(hll.m, 16384)
-	sert(hll.sparse_registers ~= nil)
+	sert(hll._sparse ~= nil)
 	sert.eq(hll.buffer, nil)
-	sert.eq(hll.sparse_count, 0)
+	sert.eq(hll._count, 0)
 	sert.eq(hll:estimate(), 0)
+
+	local hllNan = HyperLogLog.new(0 / 0)
+	sert.eq(hllNan.p, 14)
+	sert.eq(hllNan.m, 16384)
+	sert.eq(hllNan:estimate(), 0)
 
 	local hll10 = HyperLogLog.new(10)
 	sert.eq(hll10.p, 10)
@@ -112,7 +140,7 @@ sert.test("new · default, custom, and clamped precisions with alpha constants",
 	sert.eq(hllFrac.p, 8)
 end)
 
-sert.test("add & estimate · numbers, strings, buffers, and duplicate items", function()
+sert.test("add & estimate · numbers, NaNs, strings across all byte lengths, buffers, and duplicates", function()
 	local HyperLogLog = getHLL()
 
 	local hll = HyperLogLog.new()
@@ -126,7 +154,7 @@ sert.test("add & estimate · numbers, strings, buffers, and duplicate items", fu
 	end
 	sert.near(hll:estimate(), 100, 5)
 
-	-- Numbers match 8-byte little-endian f64 buffers, and -0 canonicalizes to 0
+	-- Numbers match 8-byte little-endian f64 buffers, -0 canonicalizes to +0, and all NaNs canonicalize to 0x7FF80000_00000000
 	local numHll = HyperLogLog.new()
 	local f64BufHll = HyperLogLog.new()
 	for _, x in { 0, 1, -42.5, math.pi, 1e50 } do
@@ -136,24 +164,35 @@ sert.test("add & estimate · numbers, strings, buffers, and duplicate items", fu
 		f64BufHll:add(b)
 	end
 	numHll:add(-0.0)
+	numHll:add(0 / 0)
+	numHll:add(-(0 / 0))
+	numHll:add(math.sqrt(-1))
+
+	local nanBuf = buffer.create(8)
+	buffer.writeu32(nanBuf, 0, 0)
+	buffer.writeu32(nanBuf, 4, 0x7FF80000)
+	f64BufHll:add(nanBuf)
 	sert.eq(numHll:serialize(), f64BufHll:serialize())
 
-	-- Strings across empty, tail (1..11), exact 12-byte block, and multi-block (>1024B scratch growth) match buffers
+	-- Strings across 0, 1..3, 4..8, 9..12, 13..16, multi-block, and >16KB temporary buffer match raw buffers
 	local strHll = HyperLogLog.new()
 	local bufHll = HyperLogLog.new()
 	local samples = {
-		"ten_bytes!",
-		"nine_byte",
 		"",
 		"a",
 		"ab",
 		"abc",
+		"abcd",
 		"apple",
-		"banana",
-		"cherry",
+		"eight_by",
+		"nine_byte",
+		"ten_bytes!",
 		"twelve_bytes",
+		"thirteen_byte",
+		"sixteen_bytes_ok",
 		string.rep("xyz", 30),
-		string.rep("xyz", 400),
+		string.rep("xyz", 500), -- grows reusable scratch up to <= 16 KB
+		string.rep("abcd", 5000), -- 20 KB (> MAX_SCRATCH_BYTES) exercises standalone buffer path
 	}
 	for _, s in samples do
 		strHll:add(s)
@@ -162,38 +201,61 @@ sert.test("add & estimate · numbers, strings, buffers, and duplicate items", fu
 		bufHll:add(buffer.fromstring(samples[i]))
 	end
 	strHll:add("apple")
-	sert.eq(strHll:estimate(), 12)
+	sert.eq(strHll:estimate(), #samples)
 	sert.eq(bufHll:serialize(), strHll:serialize())
 end)
 
-sert.test("sparse to dense transition · switches strictly above m * 0.25 sparse registers", function()
+sert.test("sparse growth & promotion · 4x buffer growth, threshold saturation, and promotion to dense", function()
 	local HyperLogLog = getHLL()
 
-	-- p = 4 -> m = 16 -> threshold is 4
+	-- p = 4 -> m = 16 -> max sparse count is (16 * 3) // 16 = 3
 	local hll = HyperLogLog.new(4)
-	for i = 1, 4 do
+	sert.eq(buffer.len(hll._sparse), 16)
+	for i = 1, 3 do
 		hll:add(i)
 	end
-	sert(hll.sparse_registers ~= nil)
+	sert(hll._sparse ~= nil)
 	sert.eq(hll.buffer, nil)
-	sert.eq(hll:estimate(), 4)
-	sert.eq(hll.sparse_count, 4)
+	sert.eq(hll:estimate(), 3)
+	sert.eq(hll._count, 3)
 
-	-- Re-adding an existing item does not increment sparse_count or trigger conversion
-	hll:add(1)
-	sert(hll.sparse_registers ~= nil)
-	sert.eq(hll:estimate(), 4)
-	sert.eq(hll.sparse_count, 4)
+	-- Re-adding existing items hundreds of times never promotes or inflates _count
+	for _ = 1, 200 do
+		hll:add(1)
+		hll:add(2)
+		hll:add(3)
+	end
+	sert(hll._sparse ~= nil)
+	sert.eq(hll._count, 3)
+	sert.eq(hll:estimate(), 3)
 
-	hll:add(5)
-	sert.eq(hll.sparse_registers, nil)
+	-- 4th distinct register promotes directly to dense
+	hll:add(4)
+	sert.eq(hll._sparse, nil)
 	sert(hll.buffer ~= nil)
-	sert.eq(hll.sparse_count, 0)
+	sert.eq(hll._count, 0)
 	sert.eq(buffer.len(hll.buffer), 17)
 	sert.eq(buffer.readu8(hll.buffer, 0), 4)
+
+	-- p = 10 -> m = 1024 -> sparse buffer grows 128B -> 512B -> 1024B -> dense above 768
+	local h10 = HyperLogLog.new(10)
+	sert.eq(buffer.len(h10._sparse), 128)
+	for i = 1, 30 do
+		h10:add(i)
+	end
+	sert.eq(buffer.len(h10._sparse), 512)
+	for i = 31, 100 do
+		h10:add(i)
+	end
+	sert.eq(buffer.len(h10._sparse), 1024)
+	for i = 101, 800 do
+		h10:add(i)
+	end
+	sert.eq(h10._sparse, nil)
+	sert(h10.buffer ~= nil)
 end)
 
--- Exact inverse of the 12-byte lookup3 hash so tests can deterministically hit any target (hi, lo)
+-- Exact inverse of the 12-byte lookup3 finalizer so tests can deterministically hit any target (hi, lo)
 local function craftHash12(hi: number, lo: number): buffer
 	local bxor = bit32.bxor
 	local lrotate = bit32.lrotate
@@ -201,7 +263,6 @@ local function craftHash12(hi: number, lo: number): buffer
 
 	local c, b, a = hi, lo, 0
 
-	-- Invert final
 	b = bxor(bor(b + lrotate(a, 25), 0), a)
 	a = bxor(bor(a + lrotate(c, 11), 0), c)
 	c = bxor(bor(c + lrotate(b, 24), 0), b)
@@ -212,20 +273,6 @@ local function craftHash12(hi: number, lo: number): buffer
 	a = bxor(bor(a + lrotate(c, 11), 0), c)
 	c = bxor(bor(c + lrotate(b, 14), 0), b)
 
-	-- Invert mix
-	b = bor(b - a, 0)
-	c = bor(bxor(c, lrotate(b, 4)) + b, 0)
-	a = bor(a - c, 0)
-	b = bor(bxor(b, lrotate(a, 19)) + a, 0)
-	c = bor(c - b, 0)
-	a = bor(bxor(a, lrotate(c, 16)) + c, 0)
-	b = bor(b - a, 0)
-	c = bor(bxor(c, lrotate(b, 8)) + b, 0)
-	a = bor(a - c, 0)
-	b = bor(bxor(b, lrotate(a, 6)) + a, 0)
-	c = bor(c - b, 0)
-	a = bor(bxor(a, lrotate(c, 4)) + c, 0)
-
 	local out = buffer.create(12)
 	buffer.writeu32(out, 0, bor(a - (0xDEADBEEF + 12), 0))
 	buffer.writeu32(out, 4, bor(b - (0x9E3779B9 + 12), 0))
@@ -233,26 +280,61 @@ local function craftHash12(hi: number, lo: number): buffer
 	return out
 end
 
-sert.test("getRho & raiseSparse · handles upper-32 zero run into lo and raising existing sparse register", function()
-	local HyperLogLog = getHLL()
+sert.test(
+	"getRho & raiseSparse · handles flagged/unflagged sparse entries, lazy lo, and cached dense updates",
+	function()
+		local HyperLogLog = getHLL()
 
-	local hll = HyperLogLog.new(14)
-	-- Sparse: top 25 bits = index 5, bottom 7 bits of hi = 0, lo has 4 leading zeros -> rho = 7 + 4 + 1 = 12
-	hll:add(craftHash12(bit32.lshift(5, 7), 0x08000000))
-	sert.eq(hll:serialize(), makeSparse(14, 1, { 5 * 64 + 12 }))
-	sert.eq(hll.sparse_count, 1)
+		local hll = HyperLogLog.new(14)
+		-- Flagged sparse index at p = 14 (lower 11 bits of 25-bit index == 0): index = 5 * 2048 = 10240
+		-- Bottom 7 bits of hi = 0, lo has 4 leading zeros -> rho = 7 + 4 + 1 = 12
+		local flaggedIdx = bit32.lshift(5, 11)
+		local hiFlagged = bit32.lshift(flaggedIdx, 7)
+		hll:add(craftHash12(hiFlagged, 0x08000000))
+		sert.eq(hll:serialize(), makeSparseEntries(14, { { flaggedIdx, 12 } }))
+		sert.eq(hll._count, 1)
 
-	-- Same sparse index 5, smaller rho (bottom 7 bits has 1 at bit 6 -> rho = 1): should not lower register
-	hll:add(craftHash12(bit32.lshift(5, 7) + 64, 0))
-	sert.eq(hll:serialize(), makeSparse(14, 1, { 5 * 64 + 12 }))
-	sert.eq(hll.sparse_count, 1)
-	sert.eq(#hll.sparse_registers, 1)
+		-- Same flagged index, smaller rho (bottom 7 bits has 1 at bit 6 -> rho = 1): does not lower register
+		hll:add(craftHash12(hiFlagged + 64, 0))
+		sert.eq(hll:serialize(), makeSparseEntries(14, { { flaggedIdx, 12 } }))
+		sert.eq(hll._count, 1)
 
-	-- Same sparse index 5, larger rho (bottom 7 bits = 0, lo = 0 -> rho = 7 + 32 + 1 = 40): raises register
-	hll:add(craftHash12(bit32.lshift(5, 7), 0))
-	sert.eq(hll:serialize(), makeSparse(14, 1, { 5 * 64 + 40 }))
-	sert.eq(hll.sparse_count, 1)
-end)
+		-- Same flagged index, larger rho (bottom 7 bits = 0, lo = 0 -> rho = 7 + 32 + 1 = 40): raises register
+		hll:add(craftHash12(hiFlagged, 0))
+		sert.eq(hll:serialize(), makeSparseEntries(14, { { flaggedIdx, 40 } }))
+		sert.eq(hll._count, 1)
+
+		-- Unflagged sparse index (lower 11 bits ~= 0): index = 5 omits rho byte in wire encoding
+		hll:add(craftHash12(bit32.lshift(5, 7), 0x08000000))
+		sert.eq(hll:serialize(), makeSparseEntries(14, { { 5 }, { flaggedIdx, 40 } }))
+		sert.eq(hll._count, 2)
+
+		-- Dense lazy `lo` path (rest == 0) + incremental _sum / _zeros maintenance once estimate() is cached
+		local dense = toDenseCopy(HyperLogLog, HyperLogLog.new(4))
+		sert.eq(dense:estimate(), 0) -- populates _sum = 16, _zeros = 16
+		-- Bucket 3 (top 4 bits = 2), bottom 28 bits of hi = 0, lo has 5 leading zeros -> rho = 29 + 5 = 34
+		dense:add(craftHash12(bit32.lshift(2, 28), 0x04000000))
+		sert.eq(buffer.readu8(dense.buffer, 3), 34)
+		sert.eq(dense._zeros, 15)
+		-- Raising same non-zero register updates _sum without decrementing _zeros again
+		dense:add(craftHash12(bit32.lshift(2, 28), 0))
+		sert.eq(buffer.readu8(dense.buffer, 3), 61)
+		sert.eq(dense._zeros, 15)
+		local cachedEst = dense:estimate()
+		dense._sum = nil
+		sert.eq(dense:estimate(), cachedEst)
+
+		-- Verify incremental _sum maintenance in bias-corrected / raw harmonic regime (nZeros == 0)
+		local fullDense = HyperLogLog.deserialize(makeDense(4, table.create(16, 1)))
+		sert.eq(fullDense:estimate(), 18) -- caches _sum = 8, _zeros = 0
+		fullDense:add(craftHash12(bit32.lshift(2, 28), 0)) -- raises bucket 3 from 1 to 61 (_sum: 8 -> 7.5 + 2^-61)
+		local incSum = fullDense._sum
+		local incEst = fullDense:estimate()
+		fullDense._sum = nil
+		sert.eq(fullDense:estimate(), incEst)
+		sert.eq(fullDense._sum, incSum)
+	end
+)
 
 sert.test(
 	"estimate · matches HLL++ reference values across sparse, linear counting, bias-corrected, and large ranges",
@@ -261,11 +343,10 @@ sert.test(
 
 		-- Sparse linear counting over 2^25 registers
 		local sparse = HyperLogLog.new(4)
-		sparse.sparse_registers = { 1, 64 + 1, 128 + 1 }
-		sparse.sparse_count = 3
+		sparse._count = 3
 		sert.eq(sparse:estimate(), 3)
 
-		sparse.sparse_count = 1000
+		sparse._count = 1000
 		sert.eq(sparse:estimate(), 1000)
 
 		local function denseWith(p: number, fill: number, overrides: { [number]: number }?)
@@ -275,10 +356,7 @@ sert.test(
 					regs[index] = rho
 				end
 			end
-			local h = HyperLogLog.new(p)
-			h.sparse_registers = nil
-			h.buffer = makeDense(p, regs)
-			return h
+			return HyperLogLog.deserialize(makeDense(p, regs))
 		end
 
 		-- Dense linear counting: p=4 (m=16, threshold=10), 8 zeros -> 16 * ln(2) = 11.09 > 10, falls through to bias-corrected
@@ -304,14 +382,13 @@ sert.test(
 		)
 
 		-- Dense with no zeros, raw <= 5*m: raw estimate minus interpolated bias
-		sert.eq(denseWith(4, 1):estimate(), 18) -- raw 21.54, interpolated bias 3.46 -> 18.08 -> 18
-		sert.eq(denseWith(4, 2):estimate(), 43) -- raw 43.08, interpolated bias -0.18 -> 43.26 -> 43
-		sert.eq(denseWith(4, 3):estimate(), 86) -- raw 86.16 > 5*16 = 80, no bias correction -> 86
-		sert.eq(denseWith(6, 2):estimate(), 179) -- raw 181.56 <= 5*64 = 320, interpolated bias 2.30 -> 179
-		sert.eq(denseWith(6, 3):estimate(), 363) -- raw 363.12 > 320, no bias correction -> 363
+		sert.eq(denseWith(4, 1):estimate(), 18)
+		sert.eq(denseWith(4, 2):estimate(), 43)
+		sert.eq(denseWith(4, 3):estimate(), 86)
+		sert.eq(denseWith(6, 2):estimate(), 179)
+		sert.eq(denseWith(6, 3):estimate(), 363)
 
-		-- Bias clamp above MEAN_DATA[1][78] (77.2394) while raw <= 5*m (80):
-		-- raw = 172.313988352 / 2.1875 = 78.7721 > 77.2394, biases[78] = -1.7606 -> 78.7721 - (-1.7606) = 80.53 -> 81
+		-- Bias clamp above MEAN_DATA[1][78] (77.2394) while raw <= 5*m (80)
 		local aboveMaxMean = denseWith(4, 3, { [1] = 2, [2] = 2, [3] = 2, [4] = 5, [5] = 5 })
 		sert.eq(aboveMaxMean:estimate(), 81)
 
@@ -381,13 +458,12 @@ sert.test("estimate · bias correction at an exact reference point and below min
 	local HyperLogLog = getHLL()
 
 	-- At p=4, MEAN_DATA[1][5] = 13.2882 and BIAS_DATA[1][5] = 8.2882 (so corrected = 5).
-	local hll = HyperLogLog.new(4)
-	hll.sparse_registers = nil
-	hll.buffer = makeDense(4, table.create(16, 1)) -- sum = 16 * 2^-1 = 8
+	local hll = HyperLogLog.deserialize(makeDense(4, table.create(16, 1)))
 	hll.alpha = 13.2882 * 8
 	sert.eq(hll:estimate(), 5)
 
 	-- Setting alpha = 10.4 * 8 makes raw = 10.4 < MEAN_DATA[1][1] (11), clamping to BIAS_DATA[1][1] (10) -> round(0.4) = 0.
+	hll._sum = nil
 	hll.alpha = 10.4 * 8
 	sert.eq(hll:estimate(), 0)
 end)
@@ -395,7 +471,7 @@ end)
 sert.test("duplicates and insertion order do not change serialized registers", function()
 	local HyperLogLog = getHLL()
 
-	for _, count in { 20, 200 } do
+	for _, count in { 10, 200 } do
 		local forward = HyperLogLog.new(6)
 		local reverse = HyperLogLog.new(6)
 		local duplicated = HyperLogLog.new(6)
@@ -413,10 +489,11 @@ sert.test("duplicates and insertion order do not change serialized registers", f
 	end
 end)
 
-sert.test("merge · union across all sparse/dense combinations and error on precision mismatch", function()
+sert.test("merge · union across all sparse/dense combinations, self-merge, and error on precision mismatch", function()
 	local HyperLogLog = getHLL()
 
-	-- 1. Sparse + Sparse (staying sparse)
+	-- 1. Sparse + Sparse (staying sparse, plus empty self / empty other / self-merge)
+	local sEmpty = HyperLogLog.new(10)
 	local s1 = HyperLogLog.new(10)
 	local s2 = HyperLogLog.new(10)
 	local sUnion = HyperLogLog.new(10)
@@ -428,29 +505,35 @@ sert.test("merge · union across all sparse/dense combinations and error on prec
 		s2:add(i)
 		sUnion:add(i)
 	end
+
+	s1:merge(s1) -- self-merge no-op
+	s1:merge(sEmpty) -- empty other no-op
+	sEmpty:merge(s1) -- empty self fast-copy
+	sert.eq(sEmpty:serialize(), s1:serialize())
+
 	s1:merge(s2)
-	sert(s1.sparse_registers ~= nil)
+	sert(s1._sparse ~= nil)
 	sert.eq(s1:serialize(), sUnion:serialize())
 
-	-- 2. Sparse + Sparse (crossing threshold into dense)
-	local sc1 = HyperLogLog.new(4) -- threshold = 4
+	-- 2. Sparse + Sparse (crossing threshold mid-merge and folding remaining entries into dense)
+	local sc1 = HyperLogLog.new(4) -- max sparse = 3
 	local sc2 = HyperLogLog.new(4)
 	local scUnion = HyperLogLog.new(4)
-	for i = 1, 3 do
+	for i = 1, 2 do
 		sc1:add(i)
 		scUnion:add(i)
 	end
-	for i = 4, 6 do
+	for i = 3, 5 do
 		sc2:add(i)
 		scUnion:add(i)
 	end
-	sert(sc1.sparse_registers ~= nil)
-	sert(sc2.sparse_registers ~= nil)
+	sert(sc1._sparse ~= nil)
+	sert(sc2._sparse ~= nil)
 	sc1:merge(sc2)
-	sert.eq(sc1.sparse_registers, nil)
+	sert.eq(sc1._sparse, nil)
 	sert.eq(sc1:serialize(), scUnion:serialize())
 
-	-- 3. Dense + Sparse and Sparse + Dense
+	-- 3. Dense + Sparse, Sparse + Dense, and Empty Sparse + Dense (preserving cached _sum)
 	local dBase = HyperLogLog.new(4)
 	local sExtra = HyperLogLog.new(4)
 	local dsUnion = HyperLogLog.new(4)
@@ -458,45 +541,53 @@ sert.test("merge · union across all sparse/dense combinations and error on prec
 		dBase:add(i)
 		dsUnion:add(i)
 	end
-	for i = 11, 13 do
+	for i = 11, 12 do
 		sExtra:add(i)
 		dsUnion:add(i)
 	end
-	sert.eq(dBase.sparse_registers, nil)
-	sert(sExtra.sparse_registers ~= nil)
+	sert.eq(dBase._sparse, nil)
+	sert(sExtra._sparse ~= nil)
+	local dBaseEst = dBase:estimate() -- caches _sum on dBase
 
-	local dIntoS = HyperLogLog.deserialize(sExtra:serialize())
-	local sIntoD = HyperLogLog.deserialize(dBase:serialize())
+	local emptyIntoDense = HyperLogLog.new(4)
+	emptyIntoDense:merge(dBase)
+	sert.eq(emptyIntoDense._sum, dBase._sum)
+	sert.eq(emptyIntoDense:estimate(), dBaseEst)
+
+	local dIntoS = sExtra:clone()
+	local sIntoD = dBase:clone()
+	sIntoD:merge(HyperLogLog.new(4)) -- merging empty sparse into dense preserves _sum
+	sert.eq(sIntoD._sum, dBase._sum)
 	dIntoS:merge(dBase)
 	sIntoD:merge(sExtra)
-	sert.eq(dIntoS.sparse_registers, nil)
+	sIntoD:merge(sIntoD) -- dense self-merge no-op
+	sert.eq(dIntoS._sparse, nil)
+	sert.eq(dIntoS._count, 0)
 	sert.eq(dIntoS:serialize(), dsUnion:serialize())
 	sert.eq(sIntoD:serialize(), dsUnion:serialize())
+	sert.eq(dIntoS:estimate(), dsUnion:estimate())
+	sert.eq(sIntoD:estimate(), dsUnion:estimate())
 
-	-- 4. Dense + Dense (covering all 4 register lanes i, i+1, i+2, i+3 and identical u32 chunks)
-	local dd1 = HyperLogLog.new(4)
-	local dd2 = HyperLogLog.new(4)
-	dd1.sparse_registers = nil
-	dd2.sparse_registers = nil
-	dd1.buffer = makeDense(4, {
+	-- 4. Dense + Dense (covering both 4-byte lanes of the 8-byte unrolled loop, identical chunks, and dominated chunks)
+	local dd1 = HyperLogLog.deserialize(makeDense(4, {
 		10,
 		2,
 		10,
-		2, -- chunk 1: lanes 1,3 higher in dd1; lanes 2,4 higher in dd2
+		2,
 		5,
 		5,
 		5,
-		5, -- chunk 2: identical 4-byte chunk (skipped via readu32 fast path)
+		5,
 		1,
 		8,
 		1,
-		8, -- chunk 3: lanes 1,3 higher in dd2; lanes 2,4 higher in dd1
+		8,
 		4,
 		4,
 		4,
-		4, -- chunk 4: all higher in dd2
-	})
-	dd2.buffer = makeDense(4, {
+		4,
+	}))
+	local dd2 = HyperLogLog.deserialize(makeDense(4, {
 		3,
 		9,
 		3,
@@ -513,11 +604,10 @@ sert.test("merge · union across all sparse/dense combinations and error on prec
 		7,
 		8,
 		9,
-	})
+	}))
 	local preMergeEst = dd1:estimate()
 	dd1:merge(dd2)
 	sert(dd1:estimate() > preMergeEst)
-	-- Merging an already-dominated dense counter does not change estimate
 	local postMergeEst = dd1:estimate()
 	dd1:merge(dd2)
 	sert.eq(dd1:estimate(), postMergeEst)
@@ -551,78 +641,127 @@ sert.test("merge · union across all sparse/dense combinations and error on prec
 	end, "Cannot merge HyperLogLog objects with different precision")
 end)
 
+sert.test("clone & clear · independent copies and in-place resets across empty, sparse, and dense modes", function()
+	local HyperLogLog = getHLL()
+
+	-- Empty clone & clear
+	local empty = HyperLogLog.new(10)
+	local emptyClone = empty:clone()
+	emptyClone:add("only-in-clone")
+	sert.eq(empty:estimate(), 0)
+	sert.eq(emptyClone:estimate(), 1)
+	emptyClone:clear()
+	sert.eq(emptyClone:estimate(), 0)
+	sert.eq(emptyClone:serialize(), empty:serialize())
+
+	-- Grown sparse clone & clear (shrinks sparse buffer back to initial 128B)
+	local sparse = HyperLogLog.new(10)
+	for i = 1, 100 do
+		sparse:add(i)
+	end
+	sert(buffer.len(sparse._sparse) > 128)
+	local sparseClone = sparse:clone()
+	sert.eq(sparseClone:serialize(), sparse:serialize())
+	sparseClone:add(999999)
+	sert(buffer.tostring(sparseClone:serialize()) ~= buffer.tostring(sparse:serialize()))
+
+	sparse:clear()
+	sert.eq(sparse:estimate(), 0)
+	sert.eq(buffer.len(sparse._sparse), 128)
+	sparse:add(42)
+	sert.eq(sparse:estimate(), 1)
+
+	-- Dense clone & clear (preserves cached _sum on clone, resets dense back to sparse on clear)
+	local dense = HyperLogLog.new(4)
+	for i = 1, 25 do
+		dense:add(i)
+	end
+	local est = dense:estimate()
+	local denseClone = dense:clone()
+	sert.eq(denseClone._sum, dense._sum)
+	sert.eq(denseClone:estimate(), est)
+	denseClone:add("extra-item")
+
+	dense:clear()
+	sert.eq(dense.buffer, nil)
+	sert(dense._sparse ~= nil)
+	sert.eq(dense:estimate(), 0)
+	for i = 1, 25 do
+		dense:add(i)
+	end
+	sert.eq(dense:estimate(), est)
+end)
+
 sert.test(
 	"serialize & deserialize · empty, varint width boundaries, dense copy isolation, and oversize sparse",
 	function()
 		local HyperLogLog = getHLL()
 
-		-- Empty sparse counter
+		-- Empty sparse counter (2 bytes: header + 0 count)
 		local empty = HyperLogLog.new(10)
 		local emptyBuf = empty:serialize()
-		sert.eq(buffer.len(emptyBuf), 5)
+		sert.eq(buffer.len(emptyBuf), 2)
 		local emptyRestored = HyperLogLog.deserialize(emptyBuf)
 		sert(emptyRestored ~= nil)
 		sert.eq(emptyRestored.p, 10)
-		sert.eq(emptyRestored.sparse_count, 0)
+		sert.eq(emptyRestored._count, 0)
 		sert.eq(emptyRestored:estimate(), 0)
 
-		-- Sparse varint width boundaries (1, 2, 3, 4, and 5 bytes)
-		-- Each entry is value = index * 64 + rho (with 1 <= rho <= 40, 0 <= index < 2^25).
-		local boundaryVarintHll = HyperLogLog.new(14)
-		boundaryVarintHll.sparse_registers = {
-			1 * 64 + 1, -- value = 65 (< 128 -> 1-byte varint)
-			3 * 64 + 2, -- delta = 194 - 65 = 129 (< 16384 -> 2-byte varint)
-			300 * 64 + 3, -- delta = 19203 - 194 = 19009 (< 2097152 -> 3-byte varint)
-			40000 * 64 + 4, -- delta = 2560004 - 19203 = 2540801 (< 268435456 -> 4-byte varint)
-			5000000 * 64 + 5, -- delta = 320000005 - 2560004 = 317440001 (>= 268435456 -> 5-byte varint)
-		}
-		boundaryVarintHll.sparse_count = 5
-		local boundaryData = boundaryVarintHll:serialize()
-		sert.eq(buffer.len(boundaryData), 5 + 1 + 2 + 3 + 4 + 5)
-		local boundaryRestored = HyperLogLog.deserialize(boundaryData)
-		sert(boundaryRestored ~= nil)
-		sert.eq(boundaryRestored:serialize(), boundaryData)
+		-- Single-entry sparse counter (exercises count == 1 skip-sort path)
+		local single = HyperLogLog.new(10)
+		single:add(1)
+		local singleRestored = HyperLogLog.deserialize(single:serialize())
+		sert(singleRestored ~= nil)
+		sert.eq(singleRestored:serialize(), single:serialize())
 
-		-- Exact varint threshold boundaries: 127 vs 128, 16383 vs 16384, 2097151 vs 2097152, 268435455 vs 268435456
-		for _, targetValue in { 127, 128, 16383, 16384, 2097151, 2097152, 268435455, 268435456 } do
-			-- Pick rho in 1..40 so value = index * 64 + rho == targetValue, or test via two entries if targetValue % 64 == 0
-			local rem = targetValue % 64
-			local h = HyperLogLog.new(14)
-			if rem >= 1 and rem <= 40 then
-				h.sparse_registers = { targetValue }
-				h.sparse_count = 1
-			else
-				-- First entry at value = 32 (index 0, rho 32), second entry at value = 32 + targetValue
-				h.sparse_registers = { 32, 32 + targetValue }
-				h.sparse_count = 2
-			end
-			local enc = h:serialize()
+		-- Sparse deltaCode varint width boundaries (1, 2, 3, and 4 bytes) + flagged rho
+		-- deltaCode = (index - prevIndex - 1) * 2 + hasRho
+		local boundaryPayload = makeSparseEntries(14, {
+			{ 0, 12 }, -- index 0 (flagged): deltaCode = 1 (1B) + rho 12 (1B)
+			{ 65 }, -- index 65 (unflagged): delta = 64 -> deltaCode = 128 (2B)
+			{ 65 + 8193 }, -- unflagged: delta = 8192 -> deltaCode = 16384 (3B)
+			{ 65 + 8193 + 1048577 }, -- unflagged: delta = 1048576 -> deltaCode = 2097152 (4B)
+		})
+		local boundaryRestored = HyperLogLog.deserialize(boundaryPayload)
+		sert(boundaryRestored ~= nil)
+		sert.eq(boundaryRestored:serialize(), boundaryPayload)
+
+		-- Exact varint threshold boundaries for deltaIndex: 63 vs 64 (126/128), 8191 vs 8192, 1048575 vs 1048576
+		for _, deltaIdx in { 63, 64, 8191, 8192, 1048575, 1048576 } do
+			local idx = if deltaIdx % 2048 == 0 then deltaIdx + 1 else deltaIdx
+			local enc = makeSparseEntries(14, { { idx } })
 			local dec = HyperLogLog.deserialize(enc)
 			sert(dec ~= nil)
 			sert.eq(dec:serialize(), enc)
 		end
 
-		-- Large sparse counter (>204 registers) exercises scratch buffer reallocation during serialize
-		local largeSparse = HyperLogLog.new(12)
-		for i = 1, 500 do
+		-- Large sparse counter at p = 18 (> 3500 entries -> > 16 KB scratch buffer path in serialize)
+		local largeSparse = HyperLogLog.new(18)
+		for i = 1, 4000 do
 			largeSparse:add(i)
 		end
+		sert(largeSparse._sparse ~= nil)
 		local largeSparseData = largeSparse:serialize()
 		local largeSparseRestored = HyperLogLog.deserialize(largeSparseData)
 		sert(largeSparseRestored ~= nil)
 		sert.eq(largeSparseRestored:serialize(), largeSparseData)
+		local beforeDupCount = largeSparseRestored._count
+		for i = 1, 200 do
+			largeSparseRestored:add(i)
+		end
+		sert.eq(largeSparseRestored._count, beforeDupCount)
 
 		-- Dense round-trip and buffer isolation
 		local dense = HyperLogLog.new(4)
 		for i = 1, 20 do
 			dense:add(i)
 		end
-		sert.eq(dense.sparse_registers, nil)
+		sert.eq(dense._sparse, nil)
 		local denseData = dense:serialize()
 		local denseSnapshot = buffer.tostring(denseData)
 		local denseRestored = HyperLogLog.deserialize(denseData)
 		sert(denseRestored ~= nil)
-		sert.eq(denseRestored.sparse_registers, nil)
+		sert.eq(denseRestored._sparse, nil)
 		sert.eq(denseRestored:serialize(), denseData)
 
 		-- Mutating caller's input buffer after deserialize does not affect restored HLL
@@ -634,18 +773,31 @@ sert.test(
 		buffer.writeu8(serializedOut, 1, 60)
 		sert.eq(buffer.tostring(denseRestored:serialize()), denseSnapshot)
 
-		-- Sparse payload with count > m * 0.25 folds to dense upon deserialize
-		local over = makeSparse(4, 5, { 1, 64, 64, 64, 64 })
+		-- Oversize sparse payload (count = 4 > 3 at p = 4) folds directly to dense upon deserialize,
+		-- handling both flagged (index = 0) and unflagged entries, plus multiple entries in the same dense bucket
+		local over = makeSparseEntries(4, {
+			{ 0, 7 }, -- bucket 0, residual = 0 -> rho = 7 + 21 = 28
+			{ 1 }, -- bucket 0, residual = 1 -> rho = 21 (< 28, does not overwrite 28)
+			{ bit32.lshift(1, 21) + 1 }, -- bucket 1, unflagged -> rho = 21
+			{ bit32.lshift(2, 21), 5 }, -- bucket 2, flagged -> rho = 5 + 21 = 26
+		})
 		local overRestored = HyperLogLog.deserialize(over)
 		sert(overRestored ~= nil)
-		sert.eq(overRestored.sparse_registers, nil)
+		sert.eq(overRestored._sparse, nil)
 		sert(overRestored.buffer ~= nil)
+		sert.eq(buffer.readu8(overRestored.buffer, 0), 4)
+		sert.eq(buffer.readu8(overRestored.buffer, 1), 28)
+		sert.eq(buffer.readu8(overRestored.buffer, 2), 21)
+		sert.eq(buffer.readu8(overRestored.buffer, 3), 26)
+		local overRoundTrip = HyperLogLog.deserialize(overRestored:serialize())
+		sert(overRoundTrip ~= nil)
+		sert.eq(overRoundTrip:estimate(), overRestored:estimate())
 
-		-- Sparse payload with count == m * 0.25 stays sparse upon deserialize
-		local exactThreshold = makeSparse(4, 4, { 1, 64, 64, 64 })
-		local exactRestored = HyperLogLog.deserialize(exactThreshold)
+		-- Sparse payload at exact max load (count == 3 at p = 4) stays sparse upon deserialize
+		local exactMax = makeSparseEntries(4, { { 1 }, { 2 }, { 3 } })
+		local exactRestored = HyperLogLog.deserialize(exactMax)
 		sert(exactRestored ~= nil)
-		sert(exactRestored.sparse_registers ~= nil)
+		sert(exactRestored._sparse ~= nil)
 		sert.eq(exactRestored.buffer, nil)
 	end
 )
@@ -659,8 +811,9 @@ sert.test("deserialize · rejects invalid buffers, precisions, dense ranks, and 
 	sert.eq(HyperLogLog.deserialize("not a buffer" :: any), nil)
 	sert.eq(HyperLogLog.deserialize({} :: any), nil)
 
-	-- Empty buffer
+	-- Empty buffer and 1-byte sparse buffer
 	sert.eq(HyperLogLog.deserialize(buffer.create(0)), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, {})), nil)
 
 	-- Precision out of range [4, 18]
 	for _, p in { 0, 3, 19, 127 } do
@@ -668,16 +821,13 @@ sert.test("deserialize · rejects invalid buffers, precisions, dense ranks, and 
 		buffer.writeu8(bDense, 0, p)
 		sert.eq(HyperLogLog.deserialize(bDense), nil)
 
-		local bSparse = buffer.create(5)
-		buffer.writeu8(bSparse, 0, p + 128)
+		local bSparse = makeSparseRaw(p, { 0 })
 		sert.eq(HyperLogLog.deserialize(bSparse), nil)
 	end
 
 	-- Precision boundaries 4 and 18 are valid
-	local validP4 = makeDense(4, {})
-	sert(HyperLogLog.deserialize(validP4) ~= nil)
-	local validP18 = makeSparse(18, 0, {})
-	sert(HyperLogLog.deserialize(validP18) ~= nil)
+	sert(HyperLogLog.deserialize(makeDense(4, {})) ~= nil)
+	sert(HyperLogLog.deserialize(makeSparseEntries(18, {})) ~= nil)
 
 	-- Dense wrong length
 	for _, len in { 1, 16, 18 } do
@@ -686,48 +836,54 @@ sert.test("deserialize · rejects invalid buffers, precisions, dense ranks, and 
 		sert.eq(HyperLogLog.deserialize(b), nil)
 	end
 
-	-- Dense register rank bounds: max valid rho is 64 - p + 1 (61 for p = 4)
+	-- Dense register rank bounds across all four 4-byte lanes of the 16-byte SWAR check
 	local maxValidDense = makeDense(4, { [16] = 61 })
 	local restoredMaxDense = HyperLogLog.deserialize(maxValidDense)
 	sert(restoredMaxDense ~= nil)
 	sert.eq(buffer.readu8(restoredMaxDense.buffer, 16), 61)
 
-	local invalidDense62 = makeDense(4, { [1] = 62 })
-	sert.eq(HyperLogLog.deserialize(invalidDense62), nil)
-
-	local invalidDense255 = makeDense(4, { [16] = 255 })
-	sert.eq(HyperLogLog.deserialize(invalidDense255), nil)
-
-	-- Sparse buffer shorter than 5-byte header
-	for len = 1, 4 do
-		local b = buffer.create(len)
-		buffer.writeu8(b, 0, 4 + 128)
-		sert.eq(HyperLogLog.deserialize(b), nil)
+	for _, pos in { 1, 5, 9, 13, 16 } do
+		sert.eq(HyperLogLog.deserialize(makeDense(4, { [pos] = 62 })), nil)
+		sert.eq(HyperLogLog.deserialize(makeDense(4, { [pos] = 255 })), nil)
 	end
 
-	-- Sparse count with missing varint bytes
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, {})), nil)
-	-- Truncated mid-varint (continuation bit set on final byte)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, {}, { 0x80 })), nil)
-	-- Varint longer than 5 bytes (5 continuation bytes + 1 terminator)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, {}, { 0x80, 0x80, 0x80, 0x80, 0x80, 0x01 })), nil)
-	-- Trailing bytes after all count entries
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 0, {}, { 0x01 })), nil)
+	-- Sparse count missing / truncated / >4-byte varint / exceeding remaining bytes
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 0x80 })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 0x80, 0x80, 0x80, 0x80, 0x01 })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, {}, 1)), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 1 }, { 2 }, { 3 } }, 5)), nil)
 
-	-- Sparse rho bounds: rho == 0 is invalid, rho == 40 (SPARSE_MAX_RHO) is valid, rho == 41 is invalid
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, { 0 })), nil)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, { 64 })), nil)
-	sert(HyperLogLog.deserialize(makeSparse(4, 1, { 40 })) ~= nil)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, { 41 })), nil)
+	-- Truncated deltaCode or 5-byte deltaCode varint (both normal and oversize sparse paths)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 1, 0x80 })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 2, 1, 5 })), nil) -- second entry hits offset >= len
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 2, 1, 5, 0x80 })), nil) -- second entry truncated 2-byte varint
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 2, 1, 5, 0x80, 0x80 })), nil) -- second entry truncated 3-byte varint
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 1, 0x80, 0x80, 0x80, 0x80, 0x01 })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 4, 0x80, 0, 0, 0 })), nil)
 
-	-- Sparse index bounds: index == 2^25 - 1 is valid, index == 2^25 is invalid
+	-- Trailing bytes after all count entries (normal and oversize sparse paths)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, {}, nil, { 0x01 })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 1 }, { 2 }, { 3 }, { 4 } }, nil, { 0x01 })), nil)
+
+	-- Canonical hasRho flag mismatches (hasRho=1 on unflagged index, or hasRho=0 on flagged index)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 1, 1 * 2 + 1, 5 })), nil) -- index 1 unflagged but hasRho=1
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 1, 0 * 2 + 0 })), nil) -- index 0 flagged but hasRho=0
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 4, 1 * 2 + 1, 5, 2, 2, 2 })), nil) -- oversize flag mismatch
+
+	-- Missing rho byte, rho == 0, rho == 40 (valid), rho == 41 (invalid) in both sparse and oversize paths
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 1, 1 })), nil) -- index 0 flagged, missing rho byte
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 0, 0 } })), nil)
+	sert(HyperLogLog.deserialize(makeSparseEntries(4, { { 0, 40 } })) ~= nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 0, 41 } })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseRaw(4, { 4, 2, 2, 2, bit32.lshift(1, 21) * 2 - 7 })), nil) -- oversize missing rho
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 0, 0 }, { 1 }, { 2 }, { 3 } })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 0, 41 }, { 1 }, { 2 }, { 3 } })), nil)
+
+	-- Sparse index bounds: index == 2^25 - 1 is valid, index == 2^25 is invalid (normal and oversize)
 	local maxSparseIndex = 2 ^ 25 - 1
-	sert(HyperLogLog.deserialize(makeSparse(4, 1, { maxSparseIndex * 64 + 1 })) ~= nil)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 1, { (maxSparseIndex + 1) * 64 + 1 })), nil)
-
-	-- Sparse non-monotonic indices: duplicate index (delta = 1 within same index)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 2, { 1, 0 })), nil)
-	sert.eq(HyperLogLog.deserialize(makeSparse(4, 2, { 1, 1 })), nil)
+	sert(HyperLogLog.deserialize(makeSparseEntries(4, { { maxSparseIndex } })) ~= nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { maxSparseIndex + 1 } })), nil)
+	sert.eq(HyperLogLog.deserialize(makeSparseEntries(4, { { 1 }, { 2 }, { 3 }, { maxSparseIndex + 1 } })), nil)
 end)
 
 sert.test("foldSparse · sparse-to-dense conversion preserves exact dense ranks", function()
@@ -738,35 +894,31 @@ sert.test("foldSparse · sparse-to-dense conversion preserves exact dense ranks"
 		local sparse = HyperLogLog.new(p)
 		local dense = toDenseCopy(HyperLogLog, sparse)
 
-		local limit = math.min(200, math.floor(2 ^ p * 0.25))
+		local limit = math.min(200, (2 ^ p * 3) // 16)
 		for i = 1, limit do
 			sparse:add(i)
 			dense:add(i)
 		end
-		sert(sparse.sparse_registers ~= nil)
+		sert(sparse._sparse ~= nil)
 		sert.eq(toDenseCopy(HyperLogLog, sparse):serialize(), dense:serialize())
 	end
 
-	-- Explicit bit-level verification of foldSparse at p = 4 (diff = 21):
-	local hll = HyperLogLog.new(4)
-	hll.sparse_registers = {
-		-- bucket 0, residual = 0, rho_sparse = 7 -> rho = 7 + 21 = 28
-		7,
+	-- Explicit bit-level verification of sparse-to-dense folding at p = 4 (diff = 21)
+	local payload = makeSparseEntries(4, {
+		-- bucket 0, residual = 0 (flagged), rho_sparse = 7 -> rho = 7 + 21 = 28
+		{ 0, 7 },
 		-- bucket 1, residual has a 1 at its highest bit (bit 20) -> rho = 1
-		(bit32.lshift(1, 21) + bit32.lshift(1, 20)) * 64 + 30,
+		{ bit32.lshift(1, 21) + bit32.lshift(1, 20) },
 		-- bucket 2, residual has 5 leading zeros then a 1 (bit 15) -> rho = 6
-		(bit32.lshift(2, 21) + bit32.lshift(1, 15)) * 64 + 30,
-		-- bucket 3, two entries: residual with bit 19 (rho = 2) and residual = 0 (rho = 3 + 21 = 24); max is 24
-		(bit32.lshift(3, 21) + bit32.lshift(1, 19)) * 64 + 1,
-		bit32.lshift(3, 21) * 64 + 3,
-	}
-	hll.sparse_count = 5
+		{ bit32.lshift(2, 21) + bit32.lshift(1, 15) },
+	})
+	local hll = HyperLogLog.deserialize(payload)
+	sert(hll ~= nil and hll._sparse ~= nil)
 
 	local b = toDenseCopy(HyperLogLog, hll).buffer
 	sert.eq(buffer.readu8(b, 1), 28)
 	sert.eq(buffer.readu8(b, 2), 1)
 	sert.eq(buffer.readu8(b, 3), 6)
-	sert.eq(buffer.readu8(b, 4), 24)
 end)
 
 -- ============================================================================
@@ -785,13 +937,13 @@ local function genSketch(p: number)
 		local hll = HyperLogLog.new(p)
 		local mode = g:pick({ "empty", "sparse", "dense" })
 		if mode == "sparse" then
-			local maxSparse = math.max(1, math.min(4, math.floor(2 ^ p * 0.25)))
+			local maxSparse = math.max(1, math.min(4, (2 ^ p * 3) // 16))
 			local n = g:int(1, maxSparse)
 			for i = 1, n do
 				hll:add(i * 100 + g:int(0, 15))
 			end
 		elseif mode == "dense" then
-			local n = math.floor(2 ^ p * 0.25) + g:int(1, 6)
+			local n = (2 ^ p * 3) // 16 + g:int(1, 6)
 			for i = 1, n do
 				hll:add(i * 10 + g:int(0, 5))
 			end
@@ -807,12 +959,8 @@ sert.laws.algebra("HyperLogLog merge", {
 	commutative = true,
 	idempotent = true,
 	op = function(a, b)
-		local HyperLogLog = getHLL()
-		local out = HyperLogLog.deserialize(a:serialize())
-		sert(out ~= nil)
-		local rhs = HyperLogLog.deserialize(b:serialize())
-		sert(rhs ~= nil)
-		out:merge(rhs)
+		local out = a:clone()
+		out:merge(b)
 		return out
 	end,
 	eq = sketchEq,
@@ -847,7 +995,7 @@ sert.laws.codec("HyperLogLog binary codec (serialize / deserialize)", {
 				hll:add(i * 10 + g:int(0, 2))
 			end
 		elseif mode == "dense" then
-			local n = math.floor(2 ^ p * 0.25) + g:int(1, 3)
+			local n = (2 ^ p * 3) // 16 + g:int(1, 3)
 			for i = 1, n do
 				hll:add(i)
 			end
@@ -869,7 +1017,7 @@ sert.laws.codec("HyperLogLog binary codec (serialize / deserialize)", {
 sert.laws.differential("HyperLogLog vs exact set oracle", {
 	gen = function(g)
 		local p = g:pick({ 4, 6, 8, 10 })
-		local threshold = math.floor(2 ^ p * 0.25)
+		local threshold = (2 ^ p * 3) // 16
 		local maxItems = math.min(threshold + 12, 48)
 		local itemPool = gen.oneOf({
 			gen.int(-50, 50),
@@ -898,8 +1046,7 @@ sert.laws.differential("HyperLogLog vs exact set oracle", {
 			hllB:add(item)
 		end
 
-		local hllUnion = HyperLogLog.deserialize(hllA:serialize())
-		sert(hllUnion ~= nil)
+		local hllUnion = hllA:clone()
 		hllUnion:merge(hllB)
 
 		return {
@@ -965,11 +1112,9 @@ sert.laws.differential("HyperLogLog vs exact set oracle", {
 		if want.exactUnion == 0 and got.estUnion ~= 0 then
 			return false
 		end
-		-- Monotonicity: count(A U B) >= max(count(A), count(B))
 		if got.estUnion < math.max(got.estA, got.estB) then
 			return false
 		end
-		-- Bounded relative error across sparse-to-dense promotion boundaries
 		local sigma = 1.04 / math.sqrt(2 ^ got.p)
 		local function withinBounds(est: number, exact: number): boolean
 			if exact == 0 then
@@ -1052,19 +1197,16 @@ sert.check(
 			end
 		end
 
-		-- Arbitrary non-buffer / random buffer payloads
 		assertValidOrNil(rawPayload)
 
 		local validBytes = sketch:serialize()
 		local len = buffer.len(validBytes)
 
-		-- Truncated buffer prefixes (0 .. len - 1)
 		local truncLen = byteIdx % len
 		local truncated = buffer.create(truncLen)
 		buffer.copy(truncated, 0, validBytes, 0, truncLen)
 		sert.eq(HyperLogLog.deserialize(truncated), nil)
 
-		-- Bit-flipped header or payload byte
 		local flipped = buffer.create(len)
 		buffer.copy(flipped, 0, validBytes)
 		local pos = byteIdx % len
@@ -1120,30 +1262,34 @@ sert.check("algebraic laws · merge forms a commutative, associative, idempotent
 	local b = build(itemsB)
 	local c = build(itemsC)
 
-	-- Idempotence: a:merge(a) == a
-	local aSelf = HyperLogLog.deserialize(a:serialize())
+	-- Idempotence: a:merge(a) == a (both aliased and cloned)
+	local aAliased = a:clone()
+	aAliased:merge(aAliased)
+	sert.eq(aAliased:serialize(), a:serialize())
+
+	local aSelf = a:clone()
 	aSelf:merge(a)
 	sert.eq(aSelf:serialize(), a:serialize())
 
 	-- Commutativity: merge(a, b) == merge(b, a)
-	local ab = HyperLogLog.deserialize(a:serialize())
+	local ab = a:clone()
 	ab:merge(b)
-	local ba = HyperLogLog.deserialize(b:serialize())
+	local ba = b:clone()
 	ba:merge(a)
 	sert.eq(ab:serialize(), ba:serialize())
 
 	-- Associativity: merge(merge(a, b), c) == merge(a, merge(b, c))
-	local abc1 = HyperLogLog.deserialize(ab:serialize())
+	local abc1 = ab:clone()
 	abc1:merge(c)
 
-	local bc = HyperLogLog.deserialize(b:serialize())
+	local bc = b:clone()
 	bc:merge(c)
-	local abc2 = HyperLogLog.deserialize(a:serialize())
+	local abc2 = a:clone()
 	abc2:merge(bc)
 	sert.eq(abc1:serialize(), abc2:serialize())
 end, { runs = 40 })
 
-sert.model("stateful counter fleet · add, merge, and serialize/deserialize match ground-truth sets", {
+sert.model("stateful counter fleet · add, merge, clone, clear, and serialize/deserialize match ground-truth sets", {
 	init = function()
 		return {
 			sets = { {}, {}, {} } :: { { [number]: boolean } },
@@ -1181,6 +1327,28 @@ sert.model("stateful counter fleet · add, merge, and serialize/deserialize matc
 				end
 			end,
 		},
+		cloneInto = {
+			gen = function(g)
+				return { dst = g:int(1, 3), src = g:int(1, 3) }
+			end,
+			run = function(sut, arg)
+				sut.counters[arg.dst] = sut.counters[arg.src]:clone()
+			end,
+			next = function(state, arg)
+				state.sets[arg.dst] = table.clone(state.sets[arg.src])
+			end,
+		},
+		clear = {
+			gen = function(g)
+				return g:int(1, 3)
+			end,
+			run = function(sut, idx)
+				sut.counters[idx]:clear()
+			end,
+			next = function(state, idx)
+				state.sets[idx] = {}
+			end,
+		},
 		roundtrip = {
 			gen = function(g)
 				return g:int(1, 3)
@@ -1205,7 +1373,7 @@ sert.model("stateful counter fleet · add, merge, and serialize/deserialize matc
 			sert.eq(sut.counters[i]:estimate(), expected:estimate())
 		end
 	end,
-}, { runs = 25, length = 15 })
+}, { runs = 30, length = 16 })
 
 -- ============================================================================
 -- Statistical Accuracy Across Precisions

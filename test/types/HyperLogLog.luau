@@ -14,6 +14,9 @@ hll:add(buffer.create(8))
 local count: number = hll:estimate()
 assert(count >= 0)
 
+local copy: Counter = hll:clone()
+copy:clear()
+
 hll:merge(hllCustom)
 
 local serialized: buffer = hll:serialize()
@@ -25,8 +28,10 @@ if restored then
 		m = restored.m,
 		alpha = restored.alpha,
 		buffer = restored.buffer,
-		sparse_registers = restored.sparse_registers,
-		sparse_count = restored.sparse_count,
+		_sparse = restored._sparse,
+		_count = restored._count,
+		_sum = restored._sum,
+		_zeros = restored._zeros,
 	}
 	assert(raw.p == 14)
 end
